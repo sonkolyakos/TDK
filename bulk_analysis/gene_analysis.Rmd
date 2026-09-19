@@ -82,3 +82,138 @@ colData <- read.csv(
 all(colnames(counts_data) %in% rownames(colData))
 
 ```
+
+```{r}
+
+keep_samples <- colData$Condition %in% c("CTR", "TIS", "REPOP")
+colData_filtered <- colData[keep_samples, , drop=FALSE]
+
+counts_data_filtered <- counts_data[, rownames(colData_filtered)]
+
+colData_filtered$Condition <- droplevels(factor(colData_filtered$Condition))
+colData_filtered$Condition <- relevel(colData_filtered$Condition, ref = "CTR")
+
+dds <- DESeqDataSetFromMatrix(countData = counts_data_filtered, 
+                              colData = colData_filtered, 
+                              design = ~ Condition)                              
+
+keep <- rowSums(counts(dds)) >= ncol(counts_data_filtered) * 5 
+dds <- dds[keep,] 
+
+
+dds <- DESeq(dds) 
+
+resultsNames(dds) 
+fl0_res <- lfcShrink(dds, coef="Condition_TIS_vs_CTR", type="apeglm") 
+
+summary(fl0_res)
+```
+
+```{r}
+draw_colnames_45 <- function(coln, gaps, ...) {
+  coord <- pheatmap:::find_coordinates(length(coln), gaps)
+  x     <- coord$coord - 0.5 * coord$size
+  res   <- textGrob(coln, x = x,
+                    y = unit(1, "npc") - unit(3, "bigpts"),
+                    vjust = 0.5, hjust = 1, rot = 45,
+                    gp = gpar(...))
+  return(res)
+}
+assignInNamespace(x = "draw_colnames", value = "draw_colnames_45",
+                  ns = asNamespace("pheatmap"))
+
+makeColorRampPalette <- function(colors, cutoff.fraction, num.colors.in.palette) {
+  stopifnot(length(colors) == 3)
+  ramp1 <- colorRampPalette(colors[1:2])(num.colors.in.palette * cutoff.fraction)
+  ramp2 <- colorRampPalette(colors[2:3])(num.colors.in.palette * (1 - cutoff.fraction))
+  return(c(ramp1, ramp2))
+}
+
+my_similarity_heatmap <- function(dist_matrix, anno_var, anno_label, cutoffthres, title) {
+  dist_matrix          <- as.matrix(dist_matrix)
+  annotation           <- data.frame(group = anno_var)
+  rownames(annotation) <- rownames(dist_matrix)
+  colnames(annotation)[1] <- as.character(anno_label)
+
+  group        <- c("#bc8f8f", "#698B69", "#6495ed")
+  names(group) <- levels(anno_var)
+  anno_colors  <- list(group = group)
+  names(anno_colors) <- anno_label
+
+  cutoff.distance <- max(dist_matrix) / cutoffthres
+  cols <- makeColorRampPalette(
+    c("#b35806", "white", "#542788"),
+    cutoff.distance / max(dist_matrix),
+    1000
+  )
+
+  pheatmap::pheatmap(
+    mat                      = dist_matrix,
+    color                    = cols,
+    border_color             = NA,
+    show_colnames            = TRUE,
+    show_rownames            = TRUE,
+    annotation_col           = annotation,
+    annotation_row           = annotation,
+    annotation_colors        = anno_colors,
+    cluster_rows             = TRUE,
+    cluster_cols             = TRUE,
+    treeheight_row           = 0,
+    clustering_method        = "complete",
+    clustering_distance_cols = "correlation",
+    clustering_distance_rows = "correlation",
+    drop_levels              = TRUE,
+    fontsize                 = 9,
+    fontsize_row             = 10,
+    main                     = title
+  )
+}
+
+# rlog transformation
+rld <- rlog(dds, blind = TRUE)
+
+conditions <- colData_filtered$Condition
+
+clean_names <- ave(
+  as.character(conditions),
+  conditions,
+  FUN = function(x) {
+    prefix <- dplyr::case_when(
+      x[1] == "CTR"   ~ "ctr",
+      x[1] == "TIS"   ~ "tis",
+      x[1] == "REPOP" ~ "repop",
+      TRUE             ~ tolower(x[1])
+    )
+    paste0(prefix, "_", seq_along(x))
+  }
+)
+
+
+colnames(rld) <- clean_names
+
+condition_factor <- factor(conditions, levels = c("CTR", "TIS", "REPOP"))
+names(condition_factor) <- clean_names
+
+# 1. Euclidean heatmap 
+mat_dist <- dist(t(assay(rld)))
+
+my_similarity_heatmap(
+  dist_matrix = mat_dist,
+  anno_var    = condition_factor,
+  anno_label  = "id",
+  cutoffthres = 1.55,
+  title       = "After Gene Filtering (Euclidean Distances)"
+)
+
+# 2. Pearson-correlation heatmap 
+mat_cor      <- cor(assay(rld), method = "pearson")
+mat_cor_dist <- as.dist(1 - mat_cor)
+
+my_similarity_heatmap(
+  dist_matrix = mat_cor_dist,
+  anno_var    = condition_factor,
+  anno_label  = "id",
+  cutoffthres = 1.55,
+  title       = "After Gene Filtering (Pearson corralation)"
+)
+```
