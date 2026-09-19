@@ -1,1 +1,38 @@
+---
+title: "gene_analysis"
+author: "Sonkoly Akos"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+library(airway)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(EnsDb.Hsapiens.v86)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(grid)
+library(ashr)
+```
