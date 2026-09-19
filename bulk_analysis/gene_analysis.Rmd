@@ -36,3 +36,49 @@ library(pheatmap)
 library(grid)
 library(ashr)
 ```
+
+```{r}
+
+input_dir <- readline(
+  prompt = "Enter the path to the directory containing rsem_counts.txt and sample_info.csv: "
+)
+
+counts_file <- file.path(input_dir, "rsem_counts.txt")
+metadata_file <- file.path(input_dir, "sample_info.csv")
+
+if (!file.exists(counts_file)) {
+  stop("Could not find: ", counts_file)
+}
+
+if (!file.exists(metadata_file)) {
+  stop("Could not find: ", metadata_file)
+}
+
+# Read RSEM counts
+raw_counts <- read.table(
+  counts_file,
+  header = TRUE,
+  row.names = 1,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Clean sample names
+colnames(raw_counts) <- gsub("\\.genes\\.results", "", colnames(raw_counts))
+colnames(raw_counts) <- gsub("-", ".", colnames(raw_counts))
+colnames(raw_counts) <- gsub("_$", "", colnames(raw_counts))
+
+# Round counts
+counts_data <- round(raw_counts)
+
+# Read sample metadata
+colData <- read.csv(
+  metadata_file,
+  stringsAsFactors = FALSE,
+  row.names = 1
+)
+
+# Check that all count-matrix samples have metadata
+all(colnames(counts_data) %in% rownames(colData))
+
+```
