@@ -43,7 +43,7 @@ load_rmats_master_table <- function(dir_path, invert_dpsi = TRUE) {
   load_one_event_type <- function(ev) {   
     f <- file.path(dir_path, paste0(ev, ".MATS.JC.txt"))
     if (!file.exists(f)) {
-      warning(sprintf("Missing file: %s - kihagyva.", f))
+      warning(sprintf("Missing file: %s - skipped.", f))
       return(NULL)
     }
 
