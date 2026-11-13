@@ -1,0 +1,2430 @@
+# 6. DGE és DAS átfedés
+
+Mennyire fedi egymást a differenciálisan expresszált (DGE) és a differenciálisan splicingolt (DAS) gének halmaza?
+Sejtvonalanként külön azonosítjuk:
+
+* szignifikáns DGE géneket,
+* legalább egy szignifikáns alternatív splicing eseményt tartalmazó géneket (DAS),
+* azokat, amelyek mindkettőt mutatják.
+
+| Kategória | Jelentés |
+|---|---|
+| **DGE + DAS** | Az expresszió és a splicing is változik ugyanabban a génben. |
+| **DAS only** | A splicing a választott küszöbökkel szignifikánsan változik, a gén szintű expresszió viszont nem éri el a DGE-küszöböt. Nem jelenti azt, hogy az expresszió egyáltalán nem változik (lásd a `DAS_only_minorDGE` oszlopot). |
+| **DGE only** | A teljes expresszió változik, szignifikáns splicing nélkül. |
+| **Neither** | Egyik elemzés sem talál szignifikáns változást a választott kritériumok mellett. |
+
+$$P(\mathrm{DGE}\mid\mathrm{DAS}) = \frac{N(\mathrm{DGE}\cap\mathrm{DAS})}{N(\mathrm{DAS})}$$
+
+**Génazonosítás.** A DGE és a splicing eredményeit Ensembl gén-ID (verziószám nélkül) alapján illesztjük, nem génszimbólum alapján,
+mert a különböző annotációs verziók szimbólumai eltérhetnek. A splicing eszközök szimbólum-kimenetét a 6.2 fejezet képezi le ID-ra.
+
+**Univerzum.** Az arány csak akkor értelmezhető, ha a "Neither" és minden százalék **ugyanarra a génuniverzumra** vonatkozik,
+ezért mindig azokat a géneket vesszük, amelyek a DGE-ben ÉS a splicing elemzésben is tesztelhetők voltak.
+
+**Statisztika.** A P(DGE|DAS)-t a háttér P(DGE)-vel vetjük össze (Fisher-teszt + odds ratio). Mivel a magasabban expresszált
+génekben mind a DGE, mind a DAS könnyebben kimutatható, a nyers asszociáció részben csak statisztikai erő-hatás lehet.
+Ezért **baseMean szerint korrigált** asszociációt is számolunk (logisztikus regresszió és Cochran–Mantel–Haenszel teszt
+baseMean-rétegeken). A p-értékeket Benjamini–Hochberg módszerrel korrigáljuk az adott DAS-/DGE-definíción belül.
+
+**Elsődleges eredmény** az azonos összehasonlításon belüli (páronkénti) átfedés. Az `Any_comparison` sor (bármelyik
+összehasonlításban szignifikáns) kiegészítő, mert ott egy gén DGE-je és DAS-a különböző összehasonlításból is származhat.
+
+```{r dge_params}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(EnsDb.Hsapiens.v86)
+  library(apeglm)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(DT)
+  library(ggVennDiagram)
+})
+
+# ====== ÁLLÍTSD BE ======
+DGE_INPUT_DIR <- "/home/akos/Desktop/lab/TDK/gene_analysis"
+
+CELL_CFG <- list(
+  t47d = list(
+    counts   = file.path(DGE_INPUT_DIR, "t47d_gene_counts.txt"),
+    meta     = file.path(DGE_INPUT_DIR, "metadata_bulk.csv"),
+    id_col   = NULL,                 # NULL = a metadata sornevei (első oszlop) az azonosítók
+    cond_col = "Condition",
+    subset   = list(col = "Sample_id", pattern = "T47D"),   # a metadata több sejtvonalat tartalmaz
+    exclude  = c("SRR32118608")      # T47D CTR_02, technikailag hibás
+  ),
+  mcf7 = list(
+    counts   = file.path(DGE_INPUT_DIR, "mcf7_gene_counts.txt"),
+    meta     = file.path(DGE_INPUT_DIR, "metadata_bulk.csv"),   # ugyanaz a fájl, mint a T47D-nél
+    id_col   = NULL,                 # első oszlop = Run (SRR...)
+    cond_col = "Condition",
+    subset   = list(col = "Sample_id", pattern = "MCF7"),
+    exclude  = character(),
+    # Az ELTE-TTK-Onko-N oszlopok nincsenek a SRA metadatában (csak az SRR32118588 van benne).
+    # Melyik Onko szám melyik kondíció (a 6.1-es PCA ábrán ellenőrizhető, hogy a minták a címkéik szerint klaszterezenek-e):
+    extra_cond = c(Onko1 = "CTR",   Onko2 = "CTR",   Onko3 = "CTR",
+                   Onko17 = "TIS",  Onko18 = "TIS",  Onko19 = "TIS",
+                   Onko34 = "REPOP", Onko35 = "REPOP")
+  )
+)
+
+# ha a metadata más kondíciónevet használ, itt képezd le CTR/TIS/REPOP-ra (nagybetűs kulcsokkal)
+COND_RECODE <- c(CONTROL = "CTR", CTRL = "CTR")
+
+COND_LEVELS    <- c("CTR", "TIS", "REPOP")
+MIN_MEAN_COUNT <- 5                  # szűrés: rowSums(counts) >= ncol * MIN_MEAN_COUNT (mint az eredeti elemzésben)
+
+DGE_PADJ       <- 0.05               # DGE szignifikancia (padj, DESeq2 Wald)
+DGE_LFC        <- 1                  # |log2FC| küszöb az apeglm-mel zsugorított LFC-n (mint a volcano plotnál)
+
+# Mi számít DGE génnek?
+#  "strict" = padj < DGE_PADJ ÉS |zsugorított log2FC| > DGE_LFC
+#  "padj"   = csak padj < DGE_PADJ (LFC-küszöb nélkül; érzékenységvizsgálat)
+DGE_DEF <- "strict"
+
+# Mi számít DAS génnek?
+#  "union"      = rMATS VAGY LeafCutter szignifikáns (legalább egy esemény bármelyik eszközben)
+#  "consensus"  = rMATS ÉS LeafCutter (összehasonlításonként), a 3. fejezet logikája
+#  "rmats" / "leafcutter" = csak az adott eszköz
+DAS_SOURCE   <- "consensus"
+
+N_STRATA <- 5                        # baseMean-rétegek száma a CMH-tesztben
+VENN_CMP <- "CTR_vs_TIS"             # melyik összehasonlítás Venn-diagramja / génlistája
+LIST_CMP <- "CTR_vs_TIS"
+# =========================
+
+DGE_CATS <- c("DGE + DAS", "DAS only", "DGE only", "Neither")
+CAT_COLS <- c("DGE + DAS" = "#C0392B", "DAS only" = "#4292C6",
+              "DGE only"  = "#F28E2B", "Neither"  = "grey85")
+```
+
+## 6.1 DGE számítása (DESeq2)
+
+Ugyanaz a módszer, mint a `gene_analysis_new.Rmd`-ben, sejtvonalanként megismételve:
+
+* `design = ~ Condition`, minták a `Sample_id` alapján szűrve, a hibás minta kizárva,
+* low-count szűrés: `rowSums(counts) >= ncol * 5`,
+* két futtatás (CTR és REPOP referenciával), `lfcShrink(type = "apeglm")`,
+* a `padj` a DESeq2 Wald-tesztjéből jön (az apeglm csak az LFC-t zsugorítja); a `results()` `alpha` paramétere a DGE-küszöbbel
+  egyezik, így az independent filtering is erre a küszöbre optimalizál. A `|log2FC| > DGE_LFC` küszöb a zsugorított LFC-re vonatkozik.
+
+Az irány a dPSI konvenciót követi (**log2FC = második − első kondíció**). A REPOP-referenciás futtatásban a
+`CTR_vs_REPOP` és `TIS_vs_REPOP` együttható CTR − REPOP, illetve TIS − REPOP, ezért ezeknek az előjelét megfordítjuk.
+A `padj = NA` gént (DESeq2 outlier / independent filtering) tesztelhetetlennek tekintjük, és kizárjuk az univerzumból.
+Az eredménytáblák Ensembl ID-t (`key`, verziószám nélkül) és `baseMean`-t is tartalmaznak.
+
+```{r dge_run}
+COMPARISONS <- c("CTR_vs_TIS", "TIS_vs_REPOP", "CTR_vs_REPOP")
+
+strip_ver <- function(x) sub("\\..*$", "", gsub('^"|"$', "", trimws(as.character(x))))
+
+ens_to_symbol <- function(ids) {
+  clean <- strip_ver(ids)
+  map <- ensembldb::select(EnsDb.Hsapiens.v86, keys = unique(clean), keytype = "GENEID",
+                           columns = c("GENEID", "SYMBOL"))
+  map <- map[!duplicated(map$GENEID), ]
+  sym <- map$SYMBOL[match(clean, map$GENEID)]
+  ifelse(is.na(sym) | sym == "", ids, sym)           # ha nincs symbol, marad az ID
+}
+
+# minta-azonosító kulcs: SRR32118588 -> "SRR32118588"; ELTE-TTK-Onko-17_S139_L001 -> "Onko17"
+sample_key <- function(x) {
+  x    <- as.character(x)
+  srr  <- stringr::str_extract(x, "SRR[0-9]+")
+  onko <- stringr::str_match(x, "Onko[-_. ]?([0-9]+)")[, 2]
+  ifelse(!is.na(srr), srr, ifelse(!is.na(onko), paste0("Onko", onko), NA_character_))
+}
+
+read_any <- function(f) {
+  if (grepl("\\.csv$", f)) read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+  else read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+NORM <- list()   # normalizált count-ok a génenkénti ábrákhoz
+VST  <- list()   # variancia-stabilizált értékek a QC-hez
+
+run_dge_cell <- function(cell) {
+  cfg <- CELL_CFG[[cell]]
+  for (f in c(cfg$counts, cfg$meta)) if (!file.exists(f)) stop("Hiányzó fájl: ", f)
+
+  # --- counts ---
+  raw <- read.table(cfg$counts, header = TRUE, row.names = 1, stringsAsFactors = FALSE, check.names = FALSE)
+  colnames(raw) <- gsub("\\.genes\\.results", "", colnames(raw))
+  colnames(raw) <- gsub("-", ".", colnames(raw))
+  colnames(raw) <- gsub("_$", "", colnames(raw))
+  counts <- round(raw)
+  ckey <- sample_key(colnames(counts))
+  if (anyNA(ckey) || anyDuplicated(ckey))
+    stop(cell, ": a count oszlopnevekből nem képezhető egyedi kulcs: ",
+         paste(colnames(counts)[is.na(ckey) | duplicated(ckey)], collapse = ", "))
+
+  # --- metadata ---
+  md <- read_any(cfg$meta)
+  if (!is.null(cfg$subset))
+    md <- md[grepl(cfg$subset$pattern, md[[cfg$subset$col]], ignore.case = TRUE), , drop = FALSE]
+  ids <- if (is.null(cfg$id_col)) md[[1]] else md[[cfg$id_col]]
+  md$key <- sample_key(ids)
+  cond <- toupper(trimws(as.character(md[[cfg$cond_col]])))
+  hit  <- cond %in% names(COND_RECODE)
+  cond[hit] <- COND_RECODE[cond[hit]]
+  md$Condition <- cond
+  excl <- sample_key(cfg$exclude)
+  md <- md[!is.na(md$key) & md$Condition %in% COND_LEVELS & !(md$key %in% excl), , drop = FALSE]
+  # kézzel megadott kondíciók azokra a count oszlopokra, amelyek nincsenek a metadatájában
+  if (length(cfg$extra_cond) > 0) {
+    if (anyNA(cfg$extra_cond)) stop(cell, ": töltsd ki az extra_cond kondícióit (jelenleg NA): ",
+                                    paste(names(cfg$extra_cond)[is.na(cfg$extra_cond)], collapse = ", "))
+    ex <- data.frame(key = names(cfg$extra_cond), Condition = toupper(unname(cfg$extra_cond)),
+                     stringsAsFactors = FALSE)
+    ex <- ex[!(ex$key %in% md$key), , drop = FALSE]
+    md <- dplyr::bind_rows(md[, c("key", "Condition")], ex)
+  }
+  if (anyDuplicated(md$key)) stop(cell, ": duplikált minta kulcs a metadatájában: ",
+                                  paste(md$key[duplicated(md$key)], collapse = ", "))
+
+  # --- illesztés kulcs alapján ---
+  common <- intersect(ckey, md$key)
+  cat(sprintf("\n[%s] count minták: %d | metadata minták: %d | illesztve: %d\n",
+              toupper(cell), length(ckey), nrow(md), length(common)))
+  if (length(setdiff(md$key, ckey)) > 0)
+    cat("  metadatában van, countban nincs:", paste(setdiff(md$key, ckey), collapse = ", "), "\n")
+  if (length(setdiff(ckey, md$key)) > 0)
+    cat("  countban van, metadatában nincs (kimarad):", paste(setdiff(ckey, md$key), collapse = ", "), "\n")
+
+  counts <- counts[, match(common, ckey), drop = FALSE]
+  cd <- data.frame(Condition = factor(md$Condition[match(common, md$key)], levels = COND_LEVELS),
+                   row.names = colnames(counts))
+  print(data.frame(count_oszlop = colnames(counts), Condition = cd$Condition), row.names = FALSE)
+  print(table(cd$Condition))
+  if (any(table(cd$Condition) < 2)) stop(cell, ": valamelyik kondícióban < 2 minta van")
+
+  # --- DESeq2: CTR és REPOP referenciával, apeglm ---
+  fit_ref <- function(ref) {
+    d <- cd; d$Condition <- relevel(d$Condition, ref = ref)
+    dds <- DESeqDataSetFromMatrix(countData = counts, colData = d, design = ~ Condition)
+    dds <- dds[rowSums(counts(dds)) >= ncol(counts) * MIN_MEAN_COUNT, ]
+    DESeq(dds, quiet = TRUE)
+  }
+  dds_ctr <- fit_ref("CTR")
+  NORM[[cell]] <<- list(mat = sweep(as.matrix(counts), 2, sizeFactors(dds_ctr), "/"), cd = cd)
+  VST[[cell]]  <<- tryCatch(vst(dds_ctr, blind = TRUE),
+                            error = function(e) varianceStabilizingTransformation(dds_ctr, blind = TRUE))
+  dds_repop <- fit_ref("REPOP")
+
+  tidy_res <- function(dds, coef, sgn) {
+    r0 <- results(dds, name = coef, alpha = DGE_PADJ)          # Wald-teszt, independent filtering alpha = DGE_PADJ
+    r  <- as.data.frame(lfcShrink(dds, coef = coef, res = r0, type = "apeglm", quiet = TRUE))
+    data.frame(Gene_ID = rownames(r), key = strip_ver(rownames(r)), baseMean = r$baseMean,
+               log2FC = sgn * r$log2FoldChange, padj = r$padj, stringsAsFactors = FALSE)
+  }
+  res <- list(
+    CTR_vs_TIS   = tidy_res(dds_ctr,   "Condition_TIS_vs_CTR",   +1),   # TIS - CTR
+    TIS_vs_REPOP = tidy_res(dds_repop, "Condition_TIS_vs_REPOP", -1),   # REPOP - TIS
+    CTR_vs_REPOP = tidy_res(dds_repop, "Condition_CTR_vs_REPOP", -1)    # REPOP - CTR
+  )
+
+  lapply(res[COMPARISONS], function(d) {
+    d$Gene_Name <- ens_to_symbol(d$Gene_ID)
+    d %>%
+      dplyr::arrange(dplyr::desc(baseMean)) %>%
+      dplyr::distinct(key, .keep_all = TRUE) %>%          # pl. PAR_Y duplikátumok: a magasabban expresszált marad
+      dplyr::mutate(padj_sig = !is.na(padj) & padj < DGE_PADJ,
+                    DGE_sig  = padj_sig & !is.na(log2FC) & abs(log2FC) > DGE_LFC)
+  })
+}
+
+CELLS <- c("mcf7", "t47d")
+dge <- setNames(lapply(CELLS, run_dge_cell), CELLS)
+
+# Ensembl ID -> megjelenítendő génnév
+KEY2SYM <- unlist(lapply(dge, function(x) setNames(x[[1]]$Gene_Name, x[[1]]$key)))
+KEY2SYM <- KEY2SYM[!duplicated(names(KEY2SYM))]
+
+for (cell in CELLS) for (cmp in COMPARISONS)
+  write.csv(dge[[cell]][[cmp]], sprintf("DGE_%s_%s.csv", cell, cmp), row.names = FALSE)
+
+cat("\nDGE szignifikáns gének (padj <", DGE_PADJ, ", |log2FC| >", DGE_LFC, "):\n")
+print(sapply(dge, function(x) sapply(x, function(d) sum(d$DGE_sig))))
+cat("\nDGE szignifikáns gének (csak padj <", DGE_PADJ, "):\n")
+print(sapply(dge, function(x) sapply(x, function(d) sum(d$padj_sig))))
+cat("\nTesztelt gének (padj nem NA):\n")
+print(sapply(dge, function(x) sapply(x, function(d) sum(!is.na(d$padj)))))
+```
+
+### Minta-QC: stimmelnek-e a kondíciócímkék?
+
+A PCA ábrán a mintáknak a kondícióik szerint kell csoportosulniuk. Ha egy minta a másik csoporthoz tartozik, a címkék
+(különösen az `extra_cond` kézi hozzárendelése) hibásak lehetnek.
+
+```{r sample_qc, fig.width=10, fig.height=4.5}
+pca_plots <- lapply(CELLS, function(cell) {
+  pd <- plotPCA(VST[[cell]], intgroup = "Condition", returnData = TRUE)
+  pv <- round(100 * attr(pd, "percentVar"), 1)
+  ggplot(pd, aes(PC1, PC2, colour = Condition, label = name)) +
+    geom_point(size = 3) +
+    geom_text(vjust = -0.9, size = 2.8, show.legend = FALSE) +
+    scale_x_continuous(expand = expansion(mult = 0.15)) +
+    scale_y_continuous(expand = expansion(mult = 0.15)) +
+    labs(title = toupper(cell), x = sprintf("PC1 (%s%%)", pv[1]), y = sprintf("PC2 (%s%%)", pv[2])) +
+    theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+})
+fig_pca <- patchwork::wrap_plots(pca_plots, ncol = 2) + patchwork::plot_layout(guides = "collect")
+print(fig_pca)
+ggsave("dge_sample_pca.png", fig_pca, width = 10, height = 4.5, dpi = 300, bg = "white")
+```
+
+## 6.2 DAS halmazok és tesztelhető univerzum
+
+A splicing eszközök génjeit (szimbólum vagy ID) egységesen Ensembl gén-ID-ra képezzük le (`to_key`).
+Elsőként az Ensembl ID-t használjuk, ha van (pl. az rMATS `GeneID` oszlopa); szimbólumokat az `org.Hs.eg.db` (aktuális szimbólumok,
+egyértelmű aliasok) és az `EnsDb.Hsapiens.v86` segítségével képezünk le. A le nem képezhető gének `SYM:<név>` kulcsot kapnak,
+így nem kerülnek a DGE-vel közös univerzumba (az ilyenek arányát kiírjuk).
+
+```{r das_sets}
+build_sym_map <- function() {
+  edb <- ensembldb::select(EnsDb.Hsapiens.v86, keys = ensembldb::keys(EnsDb.Hsapiens.v86, "GENEID"),
+                           keytype = "GENEID", columns = c("GENEID", "SYMBOL"))
+  tab <- data.frame(sym = edb$SYMBOL, ens = edb$GENEID, prio = 2L, stringsAsFactors = FALSE)
+  if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    db <- org.Hs.eg.db::org.Hs.eg.db
+    ek <- AnnotationDbi::keys(db, "ENTREZID")
+    s  <- AnnotationDbi::select(db, keys = ek, keytype = "ENTREZID", columns = c("SYMBOL", "ENSEMBL"))
+    a  <- AnnotationDbi::select(db, keys = ek, keytype = "ENTREZID", columns = c("ALIAS", "ENSEMBL"))
+    a  <- unique(a[!is.na(a$ALIAS) & !is.na(a$ENSEMBL), c("ALIAS", "ENSEMBL")])
+    a  <- a[!(a$ALIAS %in% a$ALIAS[duplicated(a$ALIAS)]), ]        # csak egyértelmű aliasok
+    tab <- rbind(tab,
+                 data.frame(sym = s$SYMBOL, ens = s$ENSEMBL, prio = 1L, stringsAsFactors = FALSE),
+                 data.frame(sym = a$ALIAS,  ens = a$ENSEMBL, prio = 3L, stringsAsFactors = FALSE))
+  } else {
+    message("Figyelem: az org.Hs.eg.db nincs telepítve, csak az EnsDb v86 szimbólumai használhatók (elavult szimbólumok kimaradhatnak).")
+  }
+  tab <- tab[!is.na(tab$sym) & tab$sym != "" & !is.na(tab$ens), ]
+  tab <- tab[order(tab$prio), ]
+  tab$up <- toupper(tab$sym)
+  tab <- tab[!duplicated(tab$up), ]
+  setNames(tab$ens, tab$up)
+}
+SYM_MAP <- build_sym_map()
+
+to_key <- function(x) {
+  x0 <- strip_ver(x)
+  out <- x0
+  is_ens <- grepl("^ENSG[0-9]+$", x0)
+  m <- unname(SYM_MAP[toupper(x0)])
+  out[!is_ens] <- ifelse(is.na(m[!is_ens]), paste0("SYM:", x0[!is_ens]), m[!is_ens])
+  out[is.na(x) | x0 %in% c("", "NA")] <- NA_character_
+  out
+}
+
+splice_in <- list(
+  mcf7 = list(rm_all = rmats_mcf7, lf_all = leaf_mcf7,
+              rm_sig = sig_genes_mcf7_rmats, lf_sig = sig_genes_mcf7_leafcutter),
+  t47d = list(rm_all = rmats_t47d, lf_all = leaf_t47d,
+              rm_sig = sig_genes_t47d_rmats, lf_sig = sig_genes_t47d_leafcutter)
+)
+
+# rMATS: ha van Ensembl-ID oszlop, azt használjuk, különben a Gene_Name-et
+rmats_keys <- function(d) {
+  col <- intersect(c("GeneID", "gene_id", "Gene_ID"), names(d))[1]
+  if (!is.na(col)) to_key(d[[col]]) else to_key(d$Gene_Name)
+}
+
+# LeafCutterben tesztelt gének (a p.adjust klaszter szintű, minden összehasonlításra közös)
+leaf_tested_genes <- function(leaf_df) {
+  leaf_df %>%
+    dplyr::filter(!is.na(gene_name), !is.na(p.adjust)) %>%
+    dplyr::pull(gene_name) %>%
+    strsplit(",") %>% unlist() %>% stringr::str_trim() %>%
+    setdiff(c("", "NA")) %>% unique() %>% to_key() %>% stats::na.omit() %>% unique()
+}
+rmats_tested_genes <- function(rm_list, cmps)
+  unique(stats::na.omit(unlist(lapply(rm_list[cmps], rmats_keys))))
+
+# egy sejtvonal + összehasonlítás-halmaz + definíció -> list(sig, tested)  (Ensembl ID kulcsokkal)
+get_das <- function(cell, cmps, source = DAS_SOURCE) {
+  S <- splice_in[[cell]]
+  rm_t <- rmats_tested_genes(S$rm_all, cmps)
+  lf_t <- leaf_tested_genes(S$lf_all)
+
+  per_cmp <- function(cmp) {
+    rm_s <- to_key(S$rm_sig[[cmp]]); lf_s <- to_key(S$lf_sig[[cmp]])
+    switch(source,
+           union      = union(rm_s, lf_s),
+           consensus  = intersect(rm_s, lf_s),
+           rmats      = rm_s,
+           leafcutter = lf_s,
+           stop("Ismeretlen DAS_SOURCE: ", source))
+  }
+  list(sig = stats::na.omit(unique(unlist(lapply(cmps, per_cmp)))),
+       tested = switch(source, union = union(rm_t, lf_t), consensus = intersect(rm_t, lf_t),
+                       rmats = rm_t, leafcutter = lf_t))
+}
+
+get_dge <- function(cell, cmps, def = DGE_DEF) {
+  d <- dplyr::bind_rows(dge[[cell]][cmps])
+  sig <- if (def == "padj") d$padj_sig else d$DGE_sig
+  list(sig    = unique(d$key[sig]),
+       minor  = if (def == "padj") character() else unique(d$key[d$padj_sig & !d$DGE_sig]),
+       tested = unique(d$key[!is.na(d$padj)]))
+}
+
+# diagnosztika: hány splicing gént nem sikerült Ensembl ID-ra leképezni
+for (cell in CELLS) {
+  S <- splice_in[[cell]]
+  k <- unique(c(rmats_tested_genes(S$rm_all, COMPARISONS), leaf_tested_genes(S$lf_all)))
+  cat(sprintf("[%s] tesztelt splicing gének: %d | nem leképezhető Ensembl ID-ra: %d (%.1f%%) | DGE-ben is tesztelt: %d\n",
+              toupper(cell), length(k), sum(grepl("^SYM:", k)), 100 * mean(grepl("^SYM:", k)),
+              length(intersect(k, unique(dplyr::bind_rows(dge[[cell]])$key[!is.na(dplyr::bind_rows(dge[[cell]])$padj)])))))
+}
+```
+
+## 6.3 Négy kategória és P(DGE | DAS)
+
+```{r overlap_calc}
+# gén szintű besorolás az univerzumon belül
+overlap_genes_tbl <- function(cell, cmps, source = DAS_SOURCE, def = DGE_DEF) {
+  das <- get_das(cell, cmps, source); dg <- get_dge(cell, cmps, def)
+  universe <- intersect(das$tested, dg$tested)
+  bm <- dge[[cell]][[1]]                                   # a baseMean minden összehasonlításban azonos
+  data.frame(key = universe, stringsAsFactors = FALSE) %>%
+    dplyr::mutate(
+      Gene_Name = unname(KEY2SYM[key]),
+      baseMean  = bm$baseMean[match(key, bm$key)],
+      DGE = key %in% dg$sig,
+      DAS = key %in% das$sig,
+      DGE_minor = key %in% dg$minor & !DGE,                # padj < küszöb, de |LFC| a küszöb alatt
+      Category = factor(dplyr::case_when(DGE & DAS ~ "DGE + DAS", DAS ~ "DAS only",
+                                         DGE ~ "DGE only", TRUE ~ "Neither"), levels = DGE_CATS))
+}
+
+# baseMean-nal korrigált asszociáció: logisztikus regresszió + Cochran-Mantel-Haenszel
+adj_stats <- function(g) {
+  out <- c(OR_adj = NA_real_, OR_adj_p = NA_real_, CMH_OR = NA_real_, CMH_p = NA_real_)
+  if (sum(g$DAS) < 5 || sum(g$DGE) < 5 || sum(!g$DAS) < 5 || sum(!g$DGE) < 5) return(out)
+  g$lbm <- log10(g$baseMean + 1)
+  m <- tryCatch(suppressWarnings(glm(DGE ~ DAS + lbm, data = g, family = binomial)), error = function(e) NULL)
+  if (!is.null(m) && "DASTRUE" %in% rownames(coef(summary(m)))) {
+    cf <- coef(summary(m))["DASTRUE", ]
+    out[["OR_adj"]] <- exp(cf[["Estimate"]]); out[["OR_adj_p"]] <- cf[["Pr(>|z|)"]]
+  }
+  brk <- unique(quantile(g$lbm, probs = seq(0, 1, length.out = N_STRATA + 1), na.rm = TRUE))
+  if (length(brk) >= 3) {
+    st  <- cut(g$lbm, brk, include.lowest = TRUE)
+    tab <- table(factor(g$DAS, c(FALSE, TRUE)), factor(g$DGE, c(FALSE, TRUE)), st)
+    mh  <- tryCatch(mantelhaen.test(tab), error = function(e) NULL)
+    if (!is.null(mh)) { out[["CMH_OR"]] <- unname(mh$estimate); out[["CMH_p"]] <- mh$p.value }
+  }
+  out
+}
+
+summarise_overlap <- function(g, cell, cmp, source, def) {
+  n <- table(g$Category)[DGE_CATS]; n[is.na(n)] <- 0
+  both <- n[[ "DGE + DAS" ]]; das_o <- n[[ "DAS only" ]]; dge_o <- n[[ "DGE only" ]]; nei <- n[[ "Neither" ]]
+  ft <- tryCatch(fisher.test(matrix(c(both, das_o, dge_o, nei), 2, byrow = TRUE)), error = function(e) NULL)
+  ad <- adj_stats(g)
+  data.frame(
+    Cell_Line = toupper(cell), Comparison = cmp, DAS_definition = source, DGE_definition = def,
+    N_universe = nrow(g), N_DGE = both + dge_o, N_DAS = both + das_o,
+    DGE_DAS = both, DAS_only = das_o, DGE_only = dge_o, Neither = nei,
+    DAS_only_minorDGE = sum(g$DAS & !g$DGE & g$DGE_minor),     # DAS only gének, amelyekben padj szignifikáns, de kis LFC
+    Neither_minorDGE  = sum(!g$DAS & !g$DGE & g$DGE_minor),
+    P_DGE_given_DAS     = ifelse(both + das_o > 0, both / (both + das_o), NA_real_),
+    P_DGE_given_notDAS  = ifelse(dge_o + nei > 0, dge_o / (dge_o + nei), NA_real_),   # P(DGE | nem DAS)
+    P_DGE_background    = ifelse(nrow(g) > 0, (both + dge_o) / nrow(g), NA_real_),    # P(DGE) az univerzumban
+    P_DAS_given_DGE     = ifelse(both + dge_o > 0, both / (both + dge_o), NA_real_),
+    Odds_ratio          = if (!is.null(ft)) unname(ft$estimate) else NA_real_,
+    Fisher_p            = if (!is.null(ft)) ft$p.value else NA_real_,
+    OR_adj = ad[["OR_adj"]], OR_adj_p = ad[["OR_adj_p"]], CMH_OR = ad[["CMH_OR"]], CMH_p = ad[["CMH_p"]],
+    stringsAsFactors = FALSE)
+}
+
+CMP_SETS <- c(as.list(COMPARISONS), list(COMPARISONS))        # 3 páros + "bármelyik" (kiegészítő)
+CMP_NAMES <- c(COMPARISONS, "Any_comparison")
+
+run_overlap <- function(source, def = DGE_DEF) {
+  res <- list(); genes <- list()
+  for (cell in CELLS) for (i in seq_along(CMP_SETS)) {
+    g <- overlap_genes_tbl(cell, CMP_SETS[[i]], source, def)
+    key <- paste(cell, CMP_NAMES[i], sep = "|")
+    genes[[key]] <- dplyr::mutate(g, Cell_Line = toupper(cell), Comparison = CMP_NAMES[i])
+    res[[key]]   <- summarise_overlap(g, cell, CMP_NAMES[i], source, def)
+  }
+  s <- dplyr::bind_rows(res)
+  # többszörös tesztelés: BH az adott (DAS-, DGE-definíció) összes sorára
+  s$Fisher_padj <- p.adjust(s$Fisher_p, "BH")
+  s$OR_adj_padj <- p.adjust(s$OR_adj_p, "BH")
+  s$CMH_padj    <- p.adjust(s$CMH_p, "BH")
+  list(summary = s, genes = dplyr::bind_rows(genes))
+}
+
+ov <- run_overlap(DAS_SOURCE, DGE_DEF)
+ov_summary <- ov$summary
+ov_genes   <- ov$genes
+
+cat(sprintf("\nDAS definíció: %s | DGE definíció: %s (padj < %s, |log2FC| > %s) | DAS: FDR < %s, |dPSI| > %s\n",
+            DAS_SOURCE, DGE_DEF, DGE_PADJ, DGE_LFC,
+            get0("SIG_THRESHOLD", ifnotfound = "?"), get0("DPSI_THRESHOLD", ifnotfound = "?")))
+print(ov_summary %>% dplyr::select(-DAS_definition, -DGE_definition) %>%
+        dplyr::mutate(dplyr::across(where(is.numeric) & !dplyr::starts_with("N_") ,
+                                    ~ signif(.x, 3))),
+      row.names = FALSE)
+
+tag <- sprintf("%s_%s", DAS_SOURCE, DGE_DEF)
+write.csv(ov_summary, sprintf("dge_das_overlap_summary_%s.csv", tag), row.names = FALSE)
+write.csv(ov_genes %>% dplyr::filter(Category != "Neither"),
+          sprintf("dge_das_gene_categories_%s.csv", tag), row.names = FALSE)
+
+DT::datatable(ov_summary %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))),
+              filter = "top", rownames = FALSE, extensions = "Buttons",
+              options = list(dom = "Bfrtip", buttons = c("excel", "csv"), pageLength = 8, scrollX = TRUE),
+              caption = "DGE x DAS átfedés. P_DGE_given_DAS = N(DGE∩DAS)/N(DAS); összevetendő a P_DGE_background-dal. OR_adj: baseMean-nal korrigált odds ratio.")
+```
+
+## 6.4 Ábrák
+
+```{r overlap_plots}
+plot_cmp_levels <- c(COMPARISONS, "Any_comparison")
+plot_cmp_labels <- c("CTR → TIS", "TIS → REPOP", "CTR → REPOP", "Any comparison (overall)")
+
+# (a) Proportions of the four categories within the universe
+cat_long <- ov_summary %>%
+  tidyr::pivot_longer(c(DGE_DAS, DAS_only, DGE_only, Neither), names_to = "Category", values_to = "n") %>%
+  dplyr::mutate(Category = factor(c(DGE_DAS = "DGE + DAS", DAS_only = "DAS only",
+                                    DGE_only = "DGE only", Neither = "Neither")[Category], levels = DGE_CATS),
+                Comparison = factor(Comparison, levels = plot_cmp_levels, labels = plot_cmp_labels),
+                frac = n / N_universe)
+
+p_cat <- ggplot(cat_long %>% dplyr::filter(Category != "Neither"),
+                aes(Comparison, n, fill = Category)) +
+  geom_col(position = "stack", width = 0.7) +
+  geom_text(aes(label = ifelse(n > 0, n, "")), position = position_stack(vjust = 0.5),
+            size = 3.2, colour = "white") +
+  facet_wrap(~ Cell_Line) +
+  scale_fill_manual(values = CAT_COLS, breaks = DGE_CATS[1:3]) +
+  labs(x = NULL, y = "Number of genes", fill = NULL,
+       title = "Overlap between DGE and DAS genes",
+       subtitle = sprintf("DAS: %s; DGE: %s; 'Neither' category (universe: genes tested in both DGE and splicing) is not shown",
+                          DAS_SOURCE, DGE_DEF)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_cat)
+ggsave(sprintf("dge_das_categories_%s.png", tag), p_cat, width = 9, height = 5, dpi = 300, bg = "white")
+
+# (b) P(DGE | DAS) compared to background P(DGE)
+p_cond <- ov_summary %>%
+  dplyr::mutate(Comparison = factor(Comparison, levels = plot_cmp_levels, labels = plot_cmp_labels),
+                sig = dplyr::case_when(OR_adj_padj < 0.001 ~ "***", OR_adj_padj < 0.01 ~ "**",
+                                       OR_adj_padj < 0.05 ~ "*", TRUE ~ ""),
+                lab = paste0(sprintf("%.1f%%", 100 * P_DGE_given_DAS), sig,
+                             ifelse(is.na(OR_adj), "", sprintf("\nOR=%.1f", OR_adj)))) %>%
+  ggplot(aes(Comparison)) +
+  geom_col(aes(y = P_DGE_given_DAS), fill = "#C0392B", width = 0.6) +
+  geom_point(aes(y = P_DGE_background), shape = 95, size = 9, colour = "black") +
+  geom_text(aes(y = P_DGE_given_DAS, label = lab), vjust = -0.3, size = 3.2, lineheight = 0.9) +
+  facet_wrap(~ Cell_Line) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.25))) +
+  labs(x = NULL, y = "P(DGE | DAS)",
+       title = "Proportion of DAS genes also showing DGE",
+       subtitle = "Black dash: background P(DGE) in universe; OR and asterisks: baseMean-adjusted logistic regression (BH-adjusted p)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_cond)
+ggsave(sprintf("dge_das_conditional_%s.png", tag), p_cond, width = 9, height = 5, dpi = 300, bg = "white")
+
+# (c) Venn diagram: for VENN_CMP comparison, stratified by cell line
+venn_dge_das <- function(cell) {
+  g <- ov_genes %>% dplyr::filter(Cell_Line == toupper(cell), Comparison == VENN_CMP)
+  
+  ggVennDiagram::ggVennDiagram(
+    list(DGE = g$key[g$DGE], DAS = g$key[g$DAS]),
+    label = "count", 
+    label_alpha = 0, 
+    set_size = 4.5, 
+    label_size = 4.5,
+    color = "black",          # Fekete körvonal a szép kontrasztért
+    lwd = 0.8
+  ) +
+    # Éles határú színskála: a legkisebb érték (metszet) "#FFF5F0", a többi fix "#C0392B"
+    scale_fill_gradientn(
+      colors = c("#FFF5F0", "#FFF5F0", "#C0392B", "#C0392B"),
+      values = c(0, 0.05, 0.1, 1) 
+    ) +
+    scale_x_continuous(expand = expansion(mult = 0.2)) +
+    labs(title = toupper(cell)) + # Fixen a sejtvonal neve felül
+    theme_void() +
+    theme(
+      legend.position = "none", 
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+    )
+}
+
+# A fixált sorrendnek köszönhetően bal oldalon MCF7, jobb oldalon T47D lesz
+fig_venn_dd <- patchwork::wrap_plots(lapply(c("MCF7", "T47D"), venn_dge_das), ncol = 2) +
+  patchwork::plot_annotation(
+    title = sprintf("DGE vs DAS genes (%s)", VENN_CMP),
+    theme = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5))
+  )
+
+print(fig_venn_dd)
+ggsave(sprintf("venn_dge_das_%s_%s.png", tag, VENN_CMP), fig_venn_dd, width = 9, height = 4.5, dpi = 300, bg = "white")
+  
+```
+```{r}
+suppressPackageStartupMessages(library(eulerr))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(grid)) # Szükséges a viewport-hoz
+
+venn_dge_das_prop <- function(cell) {
+  g <- ov_genes %>% dplyr::filter(Cell_Line == toupper(cell), Comparison == VENN_CMP)
+  
+  n_dge_only <- sum(g$DGE & !g$DAS)
+  n_das_only <- sum(!g$DGE & g$DAS)
+  n_both     <- sum(g$DGE & g$DAS)
+  
+  fit <- euler(c("DGE" = n_dge_only, "DAS" = n_das_only, "DGE&DAS" = n_both))
+  
+  p <- plot(
+    fit,
+    quantities = list(cex = 1.0, font = 2, col = "black"), 
+    labels = list(cex = 1.1, font = 2, col = "black"),     
+    edges = list(col = c("DGE" = "#1F78B4", "DAS" = "#C0392B"), lwd = 3), 
+    fills = list(fill = c("DGE" = "#9ECAE1", "DAS" = "#FC9272"), alpha = 0.4),
+    main = list(label = toupper(cell), cex = 1.3, font = 2)
+  )
+  
+  # A MEGOLDÁS: A kész eulerr plotot betesszük egy 90%-os méretű grid viewport-ba.
+  # Így minden irányban marad 5-5% üres tér a cellán belül, ahová a vastag vonal kilógathat.
+  p_scaled <- grobTree(p, vp = viewport(width = 0.9, height = 0.9))
+  
+  return(patchwork::wrap_elements(p_scaled))
+}
+
+fig_venn_euler <- patchwork::wrap_plots(lapply(c("MCF7", "T47D"), venn_dge_das_prop), ncol = 2) +
+  patchwork::plot_annotation(
+    title = sprintf("DGE vs DAS genes (%s)", VENN_CMP),
+    theme = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5))
+  )
+
+print(fig_venn_euler)
+
+# Normál 11x6-os arány a megfelelő megjelenítéshez
+ggsave(
+  sprintf("venn_dge_das_proportional_%s_%s.png", tag, VENN_CMP), 
+  fig_venn_euler, 
+  width = 11, 
+  height = 6, 
+  dpi = 300, 
+  bg = "white"
+)
+```
+
+```{r}
+library(dplyr)
+
+# 1. Összesített számok összehasonlításonként (ov_summary táblából)
+stable_expr_summary <- ov_summary %>%
+  dplyr::mutate(
+    # Szigorúan stabil expressziójú DAS gének (még minor DGE sincs)
+    Truly_stable_DAS = DAS_only - DAS_only_minorDGE,
+    # Százalékos arány az összes tesztelt DAS génhez képest
+    Pct_DAS_only_of_DAS     = round(100 * DAS_only / N_DAS, 1),
+    Pct_Truly_stable_of_DAS = round(100 * Truly_stable_DAS / N_DAS, 1)
+  ) %>%
+  dplyr::select(
+    Cell_Line,
+    Comparison,
+    N_DAS,
+    DAS_only,
+    DAS_only_minorDGE,
+    Truly_stable_DAS,
+    Pct_DAS_only_of_DAS,
+    Pct_Truly_stable_of_DAS
+  )
+
+print(as.data.frame(stable_expr_summary))
+
+# 2. A gének konkrét listájának kigyűjtése (pl. a CTR_vs_TIS-re)
+stable_genes_list <- ov_genes %>%
+  dplyr::filter(Category == "DAS only", !DGE_minor) %>%
+  dplyr::select(Cell_Line, Comparison, key, Gene_Name, baseMean)
+
+# CSV-be mentés
+write.csv(stable_expr_summary, "stable_expression_with_DAS_summary.csv", row.names = FALSE)
+write.csv(stable_genes_list, "stable_expression_with_DAS_genes.csv", row.names = FALSE)
+```
+
+
+
+## 6.5 Érzékenységvizsgálat: a DAS- és DGE-definíció hatása
+
+A P(DGE|DAS) függ attól, mit nevezünk DAS génnek (rMATS, LeafCutter, unió, konszenzus), és attól is, hogy a DGE-hez kell-e
+LFC-küszöb (`strict`) vagy elég a padj (`padj`). Az eredmény robusztusságát mind a 4 × 2 kombinációra megnézzük.
+A `DAS_only_minorDGE` oszlop azt mutatja, hogy a "DAS only" gének közül hány mutat szignifikáns (padj), de kis
+(|log2FC| ≤ küszöb) expressziós változást, vagyis nem "expresszió-változás nélküli".
+
+```{r overlap_sensitivity}
+sens_grid <- expand.grid(source = c("rmats", "leafcutter", "union", "consensus"),
+                         def = c("strict", "padj"), stringsAsFactors = FALSE)
+sens <- dplyr::bind_rows(lapply(seq_len(nrow(sens_grid)), function(i)
+  run_overlap(sens_grid$source[i], sens_grid$def[i])$summary))
+write.csv(sens, "dge_das_overlap_sensitivity.csv", row.names = FALSE)
+
+sens_tbl <- sens %>%
+  dplyr::transmute(Cell_Line, Comparison, DAS_definition, DGE_definition, N_universe, N_DAS, DGE_DAS,
+                   DAS_only_minorDGE,
+                   `P(DGE|DAS) %` = round(100 * P_DGE_given_DAS, 1),
+                   `P(DGE) háttér %` = round(100 * P_DGE_background, 1),
+                   OR_crude = round(Odds_ratio, 2), Fisher_padj = signif(Fisher_padj, 3),
+                   OR_adj = round(OR_adj, 2), OR_adj_padj = signif(OR_adj_padj, 3),
+                   CMH_OR = round(CMH_OR, 2), CMH_padj = signif(CMH_padj, 3))
+
+DT::datatable(sens_tbl, filter = "top", rownames = FALSE, extensions = "Buttons",
+              options = list(dom = "Bfrtip", buttons = c("excel", "csv"), pageLength = 12, scrollX = TRUE),
+              caption = "Érzékenységvizsgálat. A páronkénti összehasonlítások az elsődlegesek, az Any_comparison kiegészítő.")
+```
+
+## 6.6 Gének listája kategóriánként
+
+```{r overlap_gene_lists}
+gene_lists <- ov_genes %>%
+  dplyr::filter(Comparison == LIST_CMP, Category != "Neither") %>%
+  dplyr::group_by(Cell_Line, Category) %>%
+  dplyr::summarise(N = dplyr::n(), Genes = paste(sort(Gene_Name), collapse = ", "), .groups = "drop")
+
+DT::datatable(gene_lists, filter = "top", rownames = FALSE,
+              options = list(pageLength = 6, scrollX = TRUE),
+              caption = sprintf("Gének kategóriánként (%s összehasonlítás)", LIST_CMP))
+```
+
+## 6.7 Egy gén normalizált expressziója
+
+Sejtvonalanként egy oszlopdiagram: az **első oszlop** a CTR és a TIS átlagos normalizált értékének összege
+(mekkora a gén teljes jelenléte a két állapotban), a **második és harmadik oszlop** a CTR, illetve a TIS átlaga ± SD
+(a pontok az egyes minták). A panelcím a gén `CTR_vs_TIS` DGE eredményét is mutatja (log2FC iránya: TIS − CTR).
+A normalizálás a DESeq2 size factoraival történik. A gént szimbólummal vagy Ensembl ID-val is meg lehet adni;
+ha egy szimbólumhoz több ID tartozik, a legerősebben expresszált ID szerepel az ábrán és az annotációban is.
+
+```{r gene_expr_plot}
+gene_expr_plot <- function(gene, conds = c("CTR", "TIS"), 
+                           out_dir = "gene_expression_plots",
+                           save_plot = TRUE,
+                           width = 8, height = 5, dpi = 300) {
+  stopifnot(length(conds) == 2)
+  sum_lab <- paste(conds, collapse = " + ")
+  lev     <- c(sum_lab, conds)
+  gk      <- to_key(gene)
+
+  rows <- lapply(CELLS, function(cell) {
+    N   <- NORM[[cell]]
+    idx <- which(strip_ver(rownames(N$mat)) == gk)
+    if (length(idx) == 0) return(NULL)
+    idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+    v   <- N$mat[idx, ]
+    per <- lapply(conds, function(cc) v[N$cd$Condition == cc])
+    m   <- vapply(per, mean, numeric(1))
+
+    d <- dge[[cell]][["CTR_vs_TIS"]]
+    d <- d[d$key == strip_ver(rownames(N$mat)[idx]), , drop = FALSE]
+    ann <- if (nrow(d) == 1 && !is.na(d$padj))
+      sprintf("log2FC(TIS/CTR) = %.2f, padj = %.2g", d$log2FC, d$padj) else "DGE: not tested"
+    facet <- paste0(toupper(cell), "\n", ann)
+
+    data.frame(
+      facet = facet,
+      Bar   = factor(lev, levels = lev),
+      mean  = c(sum(m), m)
+    )
+  })
+  
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0) {
+    warning("Gene not found in count matrix: ", gene)
+    return(NULL)
+  }
+  bars <- dplyr::bind_rows(rows)
+
+  p <- ggplot(bars, aes(Bar, mean, fill = Bar)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = sprintf("%.0f", mean)), vjust = -0.6, size = 3.4) +
+    facet_wrap(~ facet, scales = "free_y") +
+    scale_fill_manual(values = setNames(c("grey55", "#4292C6", "#C0392B"), lev), guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      x = NULL,
+      y = "Normalized expression (DESeq2, mean)",
+      title = gene,
+      subtitle = sprintf("First bar: sum of average normalized counts for %s", sum_lab)
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"), panel.grid.major.x = element_blank())
+
+  # Automatikus mentés
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_file <- file.path(out_dir, sprintf("gene_expr_%s.png", gene))
+    ggsave(filename = out_file, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Mentve: %s\n", out_file))
+  }
+
+  return(p)
+}
+
+# ==============================================================================
+# Futtatás és mentés az összes megadott génre
+# ==============================================================================
+genes <- c("RPS24", "SRSF3", "ZFAND1", "PFKM", "ZNF207", "ASXL1", "THOC5", "HNRNPH1", "HNRNPC", "BCL2L1", "THOC5", "ANKRD13A", "PSMB3", "SS18", "DUXAP10", "SLC24A1")
+
+for (g in genes) {
+  p <- gene_expr_plot(g)
+  if (!is.null(p)) print(p)
+}
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ==============================================================================
+# Automatikus ábrakészítő és mentő függvény
+# ==============================================================================
+plot_splice_and_expression <- function(gene, cell = "mcf7", event_type = NULL, 
+                                       out_dir = "splice_effect_plots",
+                                       save_plot = TRUE,
+                                       width = 11, height = 6, dpi = 300) {
+  cell <- tolower(cell)
+  cell_upper <- toupper(cell)
+  
+  # 1. Expresszió kinyerése a NORM objektumból
+  if (!cell %in% names(NORM)) stop("A megadott sejtvonal nincs a NORM objektumban: ", cell)
+  N <- NORM[[cell]]
+  gk <- to_key(gene)
+  
+  idx <- which(strip_ver(rownames(N$mat)) == gk)
+  if (length(idx) == 0) stop("A gén nem található az expressziós mátrixban: ", gene)
+  idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+  
+  v <- N$mat[idx, ]
+  expr_ctr <- mean(v[N$cd$Condition == "CTR"], na.rm = TRUE)
+  expr_tis <- mean(v[N$cd$Condition == "TIS"], na.rm = TRUE)
+  
+  # 2. rMATS adatok kinyerése (CTR_vs_TIS)
+  rm_dir <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_TIS", "output")
+  all_ev_types <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+  found_events <- list()
+  
+  for (ev in all_ev_types) {
+    f <- file.path(rm_dir, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) next
+    raw_df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    match_rows <- raw_df[raw_df$geneSymbol == gene, ]
+    if (nrow(match_rows) > 0) {
+      match_rows$EventType <- ev
+      found_events[[ev]] <- match_rows
+    }
+  }
+  
+  if (length(found_events) == 0) stop("A génhez nem található rMATS esemény: ", gene)
+  ev_df <- dplyr::bind_rows(found_events)
+  
+  if (!is.null(event_type)) {
+    ev_df <- ev_df[ev_df$EventType == event_type, ]
+  }
+  ev_top <- ev_df %>% dplyr::arrange(FDR, dplyr::desc(abs(IncLevelDifference))) %>% dplyr::slice(1)
+  
+  ev_type_chosen <- ev_top$EventType
+  fdr_val        <- as.numeric(ev_top$FDR)
+  dpsi_val       <- -as.numeric(ev_top$IncLevelDifference) # dPSI = TIS - CTR konvenció
+  
+  psi_ctr <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel1), ",")[[1]]), na.rm = TRUE)
+  psi_tis <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel2), ",")[[1]]), na.rm = TRUE)
+  
+  # 3. Adattábla felépítése
+  df_plot <- data.frame(
+    Condition = factor(c("CTR", "TIS"), levels = c("CTR", "TIS")),
+    Mean_Expr = c(expr_ctr, expr_tis),
+    PSI       = c(psi_ctr, psi_tis)
+  ) %>%
+    dplyr::mutate(
+      Inclusion_fraction   = PSI,
+      Alternative_fraction = 1 - PSI,
+      Inclusion_weighted   = Mean_Expr * PSI,
+      Alternative_weighted = Mean_Expr * (1 - PSI)
+    )
+  
+  df_composition <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_fraction, Alternative = Alternative_fraction) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Fraction") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  df_weighted <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_weighted, Alternative = Alternative_weighted) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Counts") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  splice_colors <- c("Inclusion" = "#D95F02", "Alternative" = "#1F78B4")
+  
+  # 4. Ábrák elkészítése
+  p_weighted <- ggplot(df_weighted, aes(x = Condition, y = Counts, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors, labels = c("Alternative usage", "Inclusion usage")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.08)), labels = scales::comma) +
+    labs(
+      title = "Expression-weighted splice composition",
+      subtitle = "Bar height = mean normalized gene expression; segment fraction = local PSI",
+      x = NULL, y = "Mean normalized gene expression",
+      fill = "Local splice usage"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9.5, color = "grey30"),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  p_composition <- ggplot(df_composition, aes(x = Condition, y = Fraction, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors) +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.05)), breaks = seq(0, 1, 0.25)) +
+    labs(
+      title = "Splice composition",
+      subtitle = "Mean rMATS PSI; independent of gene-expression change",
+      x = NULL, y = "Mean rMATS PSI composition"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9.5, color = "grey30"),
+      legend.position = "none",
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  fig_combined <- (p_weighted + p_composition) +
+    plot_annotation(
+      title = sprintf("%s %s | %s | \u0394PSI=%.3f | FDR=%.1e", cell_upper, gene, ev_type_chosen, dpsi_val, fdr_val),
+      subtitle = "Total transcription and local alternative-splicing usage shown together",
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 11, color = "grey20")
+      )
+    )
+  
+  # 5. Automatikus mentés az adott sejtvonallal és génnévvel
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_filename <- file.path(out_dir, sprintf("splice_effect_%s_%s.png", cell, gene))
+    ggsave(filename = out_filename, plot = fig_combined, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Ábra sikeresen elmentve: %s\n", out_filename))
+  }
+  
+  return(fig_combined)
+}
+
+candidate_genes <- c("RPS24", "SRSF3", "ZFAND1", "PFKM", "ZNF207", "ASXL1", "THOC5", "HNRNPH1", "HNRNPC", "BCL2L1")
+
+for (g in candidate_genes) {
+  plot_splice_and_expression(g, cell = "mcf7")
+  plot_splice_and_expression(g, cell = "t47d")
+}
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ==============================================================================
+# Automatikus 3-kondíciós (CTR, TIS, REPOP) splicing + expresszió ábrázoló
+# ==============================================================================
+plot_splice_and_expression_3cond <- function(gene, cell = "mcf7", 
+                                            event_type = NULL, 
+                                            event_id = NULL,
+                                            out_dir = "splice_effect_plots_3cond",
+                                            save_plot = TRUE,
+                                            width = 12, height = 6, dpi = 300) {
+  cell <- tolower(cell)
+  cell_upper <- toupper(cell)
+  
+  # 1. Expresszió kinyerése a NORM objektumból (CTR, TIS, REPOP)
+  if (!cell %in% names(NORM)) stop("A megadott sejtvonal nincs a NORM objektumban: ", cell)
+  N <- NORM[[cell]]
+  gk <- to_key(gene)
+  
+  idx <- which(strip_ver(rownames(N$mat)) == gk)
+  if (length(idx) == 0) stop("A gén nem található az expressziós mátrixban: ", gene)
+  idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+  
+  v <- N$mat[idx, ]
+  expr_ctr   <- mean(v[N$cd$Condition == "CTR"], na.rm = TRUE)
+  expr_tis   <- mean(v[N$cd$Condition == "TIS"], na.rm = TRUE)
+  expr_repop <- mean(v[N$cd$Condition == "REPOP"], na.rm = TRUE)
+  
+  # 2. rMATS esemény azonosítása (CTR_vs_TIS futtatásból)
+  rm_dir_tis <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_TIS", "output")
+  all_ev_types <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+  found_events <- list()
+  
+  for (ev in all_ev_types) {
+    f <- file.path(rm_dir_tis, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) next
+    raw_df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    match_rows <- raw_df[raw_df$geneSymbol == gene, ]
+    if (nrow(match_rows) > 0) {
+      match_rows$EventType <- ev
+      coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(match_rows), value = TRUE)
+      pos_vec <- apply(match_rows[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+      match_rows$Event_ID <- paste(ev, match_rows$chr, match_rows$strand, pos_vec, sep = "_")
+      found_events[[ev]] <- match_rows
+    }
+  }
+  
+  if (length(found_events) == 0) stop("A génhez nem található rMATS esemény: ", gene)
+  ev_df <- dplyr::bind_rows(found_events)
+  
+  # Szűrés ha specifikáltál event_id-t vagy event_type-ot
+  if (!is.null(event_id)) {
+    ev_df <- ev_df[ev_df$Event_ID == event_id, ]
+  } else if (!is.null(event_type)) {
+    ev_df <- ev_df[ev_df$EventType == event_type, ]
+  }
+  
+  if (nrow(ev_df) == 0) stop("A megadott feltételekkel nem található esemény: ", gene)
+  
+  # A legszignifikánsabb CTR->TIS esemény kiválasztása
+  ev_top <- ev_df %>% dplyr::arrange(FDR, dplyr::desc(abs(IncLevelDifference))) %>% dplyr::slice(1)
+  
+  ev_type_chosen <- ev_top$EventType
+  target_event_id <- ev_top$Event_ID
+  fdr_tis        <- as.numeric(ev_top$FDR)
+  dpsi_tis       <- -as.numeric(ev_top$IncLevelDifference) # TIS - CTR
+  
+  # PSI: sample1 = CTR, sample2 = TIS
+  psi_ctr <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel1), ",")[[1]]), na.rm = TRUE)
+  psi_tis <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel2), ",")[[1]]), na.rm = TRUE)
+  
+  # 3. REPOP PSI kinyerése a CTR_vs_REPOP fájlból ugyanarra az eseményre (Event_ID egyezés)
+  rm_dir_repop <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_REPOP", "output")
+  f_repop <- file.path(rm_dir_repop, paste0(ev_type_chosen, ".MATS.JC.txt"))
+  
+  psi_repop <- NA_real_
+  dpsi_repop <- NA_real_
+  fdr_repop <- NA_real_
+  
+  if (file.exists(f_repop)) {
+    raw_repop <- read.delim(f_repop, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(raw_repop), value = TRUE)
+    pos_vec <- apply(raw_repop[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+    raw_repop$Event_ID <- paste(ev_type_chosen, raw_repop$chr, raw_repop$strand, pos_vec, sep = "_")
+    
+    match_repop <- raw_repop[raw_repop$Event_ID == target_event_id, ]
+    if (nrow(match_repop) > 0) {
+      # sample1 = CTR, sample2 = REPOP
+      psi_repop  <- mean(as.numeric(strsplit(as.character(match_repop$IncLevel2[1]), ",")[[1]]), na.rm = TRUE)
+      dpsi_repop <- -as.numeric(match_repop$IncLevelDifference[1])
+      fdr_repop  <- as.numeric(match_repop$FDR[1])
+    }
+  }
+  
+  # 4. Adattábla felépítése a 3 kondícióra
+  df_plot <- data.frame(
+    Condition = factor(c("CTR", "TIS", "REPOP"), levels = c("CTR", "TIS", "REPOP")),
+    Mean_Expr = c(expr_ctr, expr_tis, expr_repop),
+    PSI       = c(psi_ctr, psi_tis, psi_repop)
+  ) %>%
+    dplyr::mutate(
+      Inclusion_fraction   = PSI,
+      Alternative_fraction = 1 - PSI,
+      Inclusion_weighted   = Mean_Expr * PSI,
+      Alternative_weighted = Mean_Expr * (1 - PSI)
+    )
+  
+  df_composition <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_fraction, Alternative = Alternative_fraction) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Fraction") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  df_weighted <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_weighted, Alternative = Alternative_weighted) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Counts") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  splice_colors <- c("Inclusion" = "#D95F02", "Alternative" = "#1F78B4")
+  
+  # 5. Diagramok elkészítése
+  p_weighted <- ggplot(df_weighted, aes(x = Condition, y = Counts, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors, labels = c("Alternative usage", "Inclusion usage")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.08)), labels = scales::comma) +
+    labs(
+      title = "Expression-weighted splice composition",
+      subtitle = "Bar height = mean normalized gene expression; segment fraction = local PSI",
+      x = NULL, y = "Mean normalized gene expression",
+      fill = "Local splice usage"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9.5, color = "grey30"),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  p_composition <- ggplot(df_composition, aes(x = Condition, y = Fraction, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors) +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.05)), breaks = seq(0, 1, 0.25)) +
+    labs(
+      title = "Splice composition",
+      subtitle = "Mean rMATS PSI; independent of gene-expression change",
+      x = NULL, y = "Mean rMATS PSI composition"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9.5, color = "grey30"),
+      legend.position = "none",
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  sub_text <- sprintf("CTR\u2192TIS: \u0394PSI=%.3f (FDR=%.1e) | CTR\u2192REPOP: \u0394PSI=%.3f (FDR=%.1e)",
+                      dpsi_tis, fdr_tis, dpsi_repop, fdr_repop)
+  
+  fig_combined <- (p_weighted + p_composition) +
+    plot_annotation(
+      title = sprintf("%s %s | %s", cell_upper, gene, ev_type_chosen),
+      subtitle = sub_text,
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 11, color = "grey20")
+      )
+    )
+  
+  # 6. Mentés
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_filename <- file.path(out_dir, sprintf("splice_effect_3cond_%s_%s.png", cell, gene))
+    ggsave(filename = out_filename, plot = fig_combined, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Ábra sikeresen elmentve: %s\n", out_filename))
+  }
+  
+  return(fig_combined)
+}
+
+# Több génre ciklusban:
+candidate_genes <- c("RPS24", "SRSF3", "ZFAND1", "PFKM", "ZNF207", "ASXL1", "THOC5", "HNRNPH1", "HNRNPC", "BCL2L1")
+for (g in candidate_genes) {
+  plot_splice_and_expression_3cond(g, cell = "mcf7")
+  plot_splice_and_expression_3cond(g, cell = "t47d")
+}
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ==============================================================================
+# Automatikus 3-kondíciós (CTR, TIS, REPOP) Expression-Weighted Splice plot
+# ==============================================================================
+plot_expression_weighted_3cond <- function(gene, cell = "mcf7", 
+                                           event_type = NULL, 
+                                           event_id = NULL,
+                                           out_dir = "expression_weighted_plots",
+                                           save_plot = TRUE,
+                                           width = 6.5, height = 6, dpi = 300) {
+  
+  cell <- tolower(cell)
+  cell_upper <- toupper(cell)
+  
+  # 1. Expresszió kinyerése a NORM objektumból (CTR, TIS, REPOP)
+  if (!cell %in% names(NORM)) stop("A megadott sejtvonal nincs a NORM objektumban: ", cell)
+  N <- NORM[[cell]]
+  gk <- to_key(gene) # Feltételezve, hogy a to_key függvény definiálva van a környezetedben
+  
+  idx <- which(strip_ver(rownames(N$mat)) == gk)
+  if (length(idx) == 0) stop("A gén nem található az expressziós mátrixban: ", gene)
+  idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+  
+  v <- N$mat[idx, ]
+  expr_ctr   <- mean(v[N$cd$Condition == "CTR"], na.rm = TRUE)
+  expr_tis   <- mean(v[N$cd$Condition == "TIS"], na.rm = TRUE)
+  expr_repop <- mean(v[N$cd$Condition == "REPOP"], na.rm = TRUE)
+  
+  # 2. rMATS esemény azonosítása (CTR_vs_TIS futtatásból)
+  rm_dir_tis <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_TIS", "output")
+  all_ev_types <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+  found_events <- list()
+  
+  for (ev in all_ev_types) {
+    f <- file.path(rm_dir_tis, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) next
+    raw_df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    match_rows <- raw_df[raw_df$geneSymbol == gene, ]
+    if (nrow(match_rows) > 0) {
+      match_rows$EventType <- ev
+      coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(match_rows), value = TRUE)
+      pos_vec <- apply(match_rows[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+      match_rows$Event_ID <- paste(ev, match_rows$chr, match_rows$strand, pos_vec, sep = "_")
+      found_events[[ev]] <- match_rows
+    }
+  }
+  
+  if (length(found_events) == 0) stop("A génhez nem található rMATS esemény: ", gene)
+  ev_df <- dplyr::bind_rows(found_events)
+  
+  # Szűrés ha specifikáltál event_id-t vagy event_type-ot
+  if (!is.null(event_id)) {
+    ev_df <- ev_df[ev_df$Event_ID == event_id, ]
+  } else if (!is.null(event_type)) {
+    ev_df <- ev_df[ev_df$EventType == event_type, ]
+  }
+  
+  if (nrow(ev_df) == 0) stop("A megadott feltételekkel nem található esemény: ", gene)
+  
+  # A legszignifikánsabb CTR->TIS esemény kiválasztása
+  ev_top <- ev_df %>% dplyr::arrange(FDR, dplyr::desc(abs(IncLevelDifference))) %>% dplyr::slice(1)
+  
+  ev_type_chosen <- ev_top$EventType
+  target_event_id <- ev_top$Event_ID
+  fdr_tis        <- as.numeric(ev_top$FDR)
+  dpsi_tis       <- -as.numeric(ev_top$IncLevelDifference) # TIS - CTR
+  
+  # PSI: sample1 = CTR, sample2 = TIS
+  psi_ctr <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel1), ",")[[1]]), na.rm = TRUE)
+  psi_tis <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel2), ",")[[1]]), na.rm = TRUE)
+  
+  # 3. REPOP PSI kinyerése a CTR_vs_REPOP fájlból ugyanarra az eseményre
+  rm_dir_repop <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_REPOP", "output")
+  f_repop <- file.path(rm_dir_repop, paste0(ev_type_chosen, ".MATS.JC.txt"))
+  
+  psi_repop <- NA_real_
+  dpsi_repop <- NA_real_
+  fdr_repop <- NA_real_
+  
+  if (file.exists(f_repop)) {
+    raw_repop <- read.delim(f_repop, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(raw_repop), value = TRUE)
+    pos_vec <- apply(raw_repop[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+    raw_repop$Event_ID <- paste(ev_type_chosen, raw_repop$chr, raw_repop$strand, pos_vec, sep = "_")
+    
+    match_repop <- raw_repop[raw_repop$Event_ID == target_event_id, ]
+    if (nrow(match_repop) > 0) {
+      psi_repop  <- mean(as.numeric(strsplit(as.character(match_repop$IncLevel2[1]), ",")[[1]]), na.rm = TRUE)
+      dpsi_repop <- -as.numeric(match_repop$IncLevelDifference[1])
+      fdr_repop  <- as.numeric(match_repop$FDR[1])
+    }
+  }
+  
+  # 4. Adattábla felépítése a súlyozott adatokhoz
+  df_plot <- data.frame(
+    Condition = factor(c("CTR", "TIS", "REPOP"), levels = c("CTR", "TIS", "REPOP")),
+    Mean_Expr = c(expr_ctr, expr_tis, expr_repop),
+    PSI       = c(psi_ctr, psi_tis, psi_repop)
+  ) %>%
+    dplyr::mutate(
+      Inclusion_weighted   = Mean_Expr * PSI,
+      Alternative_weighted = Mean_Expr * (1 - PSI)
+    )
+  
+  df_weighted <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_weighted, Alternative = Alternative_weighted) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Counts") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  splice_colors <- c("Inclusion" = "#D95F02", "Alternative" = "#1F78B4")
+  
+  # 5. Diagram elkészítése
+  title_text <- sprintf("%s %s | %s", cell_upper, gene, ev_type_chosen)
+  sub_text <- sprintf("Expression-weighted composition\nCTR\u2192TIS: \u0394PSI=%.3f (FDR=%.1e) | CTR\u2192REPOP: \u0394PSI=%.3f (FDR=%.1e)",
+                      dpsi_tis, fdr_tis, dpsi_repop, fdr_repop)
+  
+  p_weighted <- ggplot(df_weighted, aes(x = Condition, y = Counts, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors, labels = c("Alternative usage", "Inclusion usage")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.08)), labels = scales::comma) +
+    labs(
+      title = title_text,
+      subtitle = sub_text,
+      x = NULL, 
+      y = "Mean normalized gene expression",
+      fill = "Local splice usage"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "grey20", lineheight = 1.2),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  # 6. Mentés
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_filename <- file.path(out_dir, sprintf("expr_weighted_3cond_%s_%s.png", cell, gene))
+    # A szélesség (width) szűkebbre lett véve, mert már csak egy oszlopdiagram van
+    ggsave(filename = out_filename, plot = p_weighted, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Ábra sikeresen elmentve: %s\n", out_filename))
+  }
+  
+  return(p_weighted)
+}
+
+# Futtatás a kiválasztott géneken
+candidate_genes <- c("RPS24", "SRSF3", "ZFAND1", "PFKM", "ZNF207", "ASXL1", "THOC5", "HNRNPH1", "HNRNPC", "BCL2L1", "SRSF1", "THOC5", "PSMB3", "THUMPD2")
+for (g in candidate_genes) {
+  plot_expression_weighted_3cond(g, cell = "mcf7")
+  plot_expression_weighted_3cond(g, cell = "t47d")
+}
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ==============================================================================
+# Automatikus 3-kondíciós (CTR, TIS, REPOP) Expression-Weighted Splice plot
+# ==============================================================================
+# ÚJ PARAMÉTER: force_event_id - Ha meg van adva, EZZEL szűrjük ki a rMATS sort
+plot_expression_weighted_3cond <- function(gene, cell = "mcf7", 
+                                           event_type = NULL, 
+                                           event_id = NULL,
+                                           force_event_id = NULL,
+                                           out_dir = "expression_weighted_plots",
+                                           save_plot = TRUE,
+                                           width = 6.5, height = 6, dpi = 300) {
+  
+  cell <- tolower(cell)
+  cell_upper <- toupper(cell)
+  
+  # 1. Expresszió kinyerése a NORM objektumból (CTR, TIS, REPOP)
+  if (!cell %in% names(NORM)) stop("A megadott sejtvonal nincs a NORM objektumban: ", cell)
+  N <- NORM[[cell]]
+  gk <- to_key(gene)
+  
+  idx <- which(strip_ver(rownames(N$mat)) == gk)
+  if (length(idx) == 0) stop("A gén nem található az expressziós mátrixban: ", gene)
+  idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+  
+  v <- N$mat[idx, ]
+  expr_ctr   <- mean(v[N$cd$Condition == "CTR"], na.rm = TRUE)
+  expr_tis   <- mean(v[N$cd$Condition == "TIS"], na.rm = TRUE)
+  expr_repop <- mean(v[N$cd$Condition == "REPOP"], na.rm = TRUE)
+  
+  # 2. rMATS esemény azonosítása (CTR_vs_TIS futtatásból)
+  rm_dir_tis <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_TIS", "output")
+  all_ev_types <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+  found_events <- list()
+  
+  for (ev in all_ev_types) {
+    f <- file.path(rm_dir_tis, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) next
+    raw_df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    match_rows <- raw_df[raw_df$geneSymbol == gene, ]
+    if (nrow(match_rows) > 0) {
+      match_rows$EventType <- ev
+      coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(match_rows), value = TRUE)
+      pos_vec <- apply(match_rows[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+      match_rows$Event_ID <- paste(ev, match_rows$chr, match_rows$strand, pos_vec, sep = "_")
+      found_events[[ev]] <- match_rows
+    }
+  }
+  
+  if (length(found_events) == 0) return(NULL) # Hibakezelés barátságosabban
+  ev_df <- dplyr::bind_rows(found_events)
+  
+  # KIVÁLASZTÁSI LOGIKA
+  if (!is.null(force_event_id)) {
+    # Ha kikényszerítünk egy ID-t (T47D eset), csak azt az egyet tartjuk meg
+    ev_df <- ev_df[ev_df$Event_ID == force_event_id, ]
+    if (nrow(ev_df) == 0) return(NULL)
+    ev_top <- ev_df[1, ]
+  } else {
+    # Hagyományos szűrés (MCF7 eset)
+    if (!is.null(event_id)) {
+      ev_df <- ev_df[ev_df$Event_ID == event_id, ]
+    } else if (!is.null(event_type)) {
+      ev_df <- ev_df[ev_df$EventType == event_type, ]
+    }
+    if (nrow(ev_df) == 0) return(NULL)
+    # A legszignifikánsabb CTR->TIS esemény kiválasztása
+    ev_top <- ev_df %>% dplyr::arrange(FDR, dplyr::desc(abs(IncLevelDifference))) %>% dplyr::slice(1)
+  }
+  
+  ev_type_chosen <- ev_top$EventType
+  target_event_id <- ev_top$Event_ID
+  fdr_tis        <- as.numeric(ev_top$FDR)
+  dpsi_tis       <- -as.numeric(ev_top$IncLevelDifference) 
+  
+  # PSI: sample1 = CTR, sample2 = TIS
+  psi_ctr <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel1), ",")[[1]]), na.rm = TRUE)
+  psi_tis <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel2), ",")[[1]]), na.rm = TRUE)
+  
+  # 3. REPOP PSI kinyerése a CTR_vs_REPOP fájlból ugyanarra az eseményre
+  rm_dir_repop <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_REPOP", "output")
+  f_repop <- file.path(rm_dir_repop, paste0(ev_type_chosen, ".MATS.JC.txt"))
+  
+  psi_repop <- NA_real_
+  dpsi_repop <- NA_real_
+  fdr_repop <- NA_real_
+  
+  if (file.exists(f_repop)) {
+    raw_repop <- read.delim(f_repop, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(raw_repop), value = TRUE)
+    pos_vec <- apply(raw_repop[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+    raw_repop$Event_ID <- paste(ev_type_chosen, raw_repop$chr, raw_repop$strand, pos_vec, sep = "_")
+    
+    match_repop <- raw_repop[raw_repop$Event_ID == target_event_id, ]
+    if (nrow(match_repop) > 0) {
+      psi_repop  <- mean(as.numeric(strsplit(as.character(match_repop$IncLevel2[1]), ",")[[1]]), na.rm = TRUE)
+      dpsi_repop <- -as.numeric(match_repop$IncLevelDifference[1])
+      fdr_repop  <- as.numeric(match_repop$FDR[1])
+    }
+  }
+  
+  # 4. Adattábla felépítése a súlyozott adatokhoz
+  df_plot <- data.frame(
+    Condition = factor(c("CTR", "TIS", "REPOP"), levels = c("CTR", "TIS", "REPOP")),
+    Mean_Expr = c(expr_ctr, expr_tis, expr_repop),
+    PSI       = c(psi_ctr, psi_tis, psi_repop)
+  ) %>%
+    dplyr::mutate(
+      Inclusion_weighted   = Mean_Expr * PSI,
+      Alternative_weighted = Mean_Expr * (1 - PSI)
+    )
+  
+  df_weighted <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_weighted, Alternative = Alternative_weighted) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Counts") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  splice_colors <- c("Inclusion" = "#D95F02", "Alternative" = "#1F78B4")
+  
+  # 5. Diagram elkészítése
+  title_text <- sprintf("%s %s | %s", cell_upper, gene, ev_type_chosen)
+  sub_text <- sprintf("Expression-weighted composition\nCTR\u2192TIS: \u0394PSI=%.3f (FDR=%.1e) | CTR\u2192REPOP: \u0394PSI=%.3f (FDR=%.1e)",
+                      dpsi_tis, fdr_tis, dpsi_repop, fdr_repop)
+  
+  p_weighted <- ggplot(df_weighted, aes(x = Condition, y = Counts, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors, labels = c("Alternative usage", "Inclusion usage")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.08)), labels = scales::comma) +
+    labs(
+      title = title_text,
+      subtitle = sub_text,
+      x = NULL, 
+      y = "Mean normalized gene expression",
+      fill = "Local splice usage"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "grey20", lineheight = 1.2),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  # 6. Mentés
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_filename <- file.path(out_dir, sprintf("expr_weighted_3cond_%s_%s.png", cell, gene))
+    ggsave(filename = out_filename, plot = p_weighted, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Ábra sikeresen elmentve: %s\n", out_filename))
+  }
+  
+  # Visszaadjuk a kiválasztott esemény azonosítóját is, hogy átadhassuk a másik sejtvonalnak!
+  return(list(plot = p_weighted, event_id = target_event_id))
+}
+
+# ==============================================================================
+# Futtatás
+# ==============================================================================
+candidate_genes <- c("RPS24", "SRSF3", "ZFAND1", "PFKM", "ZNF207", "ASXL1", "THOC5", "HNRNPH1", "HNRNPC", "BCL2L1", "SRSF1", "PSMB3", "THUMPD2")
+
+for (g in candidate_genes) {
+  # 1. Lekérjük az MCF7-et, és elmentjük, hogy MELYIK esemény nyert
+  mcf7_result <- plot_expression_weighted_3cond(g, cell = "mcf7")
+  
+  if (!is.null(mcf7_result)) {
+    best_mcf7_event <- mcf7_result$event_id
+    
+    # 2. A T47D-be belekényszerítjük ugyanezt az eseményt
+    t47d_result <- plot_expression_weighted_3cond(g, cell = "t47d", force_event_id = best_mcf7_event)
+    
+    if (is.null(t47d_result)) {
+      cat(sprintf("Megjegyzés: A(z) %s MCF7 eseménye (%s) nem található a T47D rMATS adatai között.\n", g, best_mcf7_event))
+    }
+  } else {
+    cat(sprintf("Hiba: %s nem található az MCF7 rMATS adatai között.\n", g))
+  }
+}
+```
+
+
+
+## 6.8 Magas konfidenciájú TIS-asszociált splicing konkordancia
+
+Az MCF7-ben **rMATS ÉS LeafCutter által egymástól függetlenül támogatott** (konszenzus DAS) géneket
+"high-confidence" génekként kezeljük, majd megnézzük, hogy a T47D-ben ugyanezek a gének milyen irányban
+és mekkora dPSI-vel splicingolódnak.
+
+* 1. panel: MCF7 referencia (szürke = az összes szignifikáns rMATS gén, színes = high-confidence gének, szín = MCF7 dPSI).
+* 2. panel: ugyanezek a gének a T47D-ben (fekete = T47D szignifikáns rMATS háttér, a színes gének megtartják az MCF7 dPSI színüket).
+* 3. panel: MCF7 dPSI vs T47D dPSI a közös high-confidence génekre (Pearson, Spearman, azonos irányú gének aránya).
+
+Gén szintű dPSI: génenként az a rMATS esemény, amely szignifikáns (FDR + |dPSI| küszöb), és közülük a legnagyobb |dPSI|-jű;
+ha a T47D-ben nincs szignifikáns esemény, a legnagyobb |dPSI|-jű esemény szerepel (ilyenkor a pont nem a szignifikáns háttér része).
+Előjel: dPSI = TIS − CTR, x tengely: DESeq2 (apeglm) log2FC, TIS vs CTR.
+
+```{r hc_concordance, fig.width=17, fig.height=6}
+suppressPackageStartupMessages(library(ggrepel))
+
+# ====== ÁLLÍTSD BE ======
+HC_CMP   <- "CTR_vs_TIS"
+REF_CELL <- "mcf7"
+TGT_CELL <- "t47d"
+HC_FDR   <- get0("SIG_THRESHOLD",  ifnotfound = 0.05)   # ha a korábbi fejezetekben definiáltad, azt veszi
+HC_DPSI  <- get0("DPSI_THRESHOLD", ifnotfound = 0.1)
+EV_TYPES <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+COL_LIM  <- 0.4                                         # a színskála +-határa
+N_LABEL  <- 12                                          # hány gén kapjon címkét (minden panelen ugyanaz a top N)
+LABEL_BY <- "mean"   # "ref" = |MCF7 dPSI| szerint; "mean" = a két sejtvonal |dPSI| átlaga szerint; "min" = a kisebbik |dPSI| szerint
+# =========================
+
+# --- 1. rMATS események beolvasása (dPSI = TIS - CTR = -IncLevelDifference) ---
+read_rmats_events <- function(cell, cmp = HC_CMP) {
+  dir <- file.path(RMATS_BASE_DIR, cell, cmp, "output")
+  dplyr::bind_rows(lapply(EV_TYPES, function(ev) {
+    f <- file.path(dir, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) return(NULL)
+    d <- read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+    data.frame(EventType = ev, GeneID = d$GeneID, geneSymbol = d$geneSymbol,
+               FDR = as.numeric(d$FDR), dPSI = -as.numeric(d$IncLevelDifference),
+               stringsAsFactors = FALSE)
+  }))
+}
+
+# --- 2. gén szintű összegzés (Ensembl kulccsal) ---
+gene_level <- function(ev) {
+  ev %>%
+    dplyr::mutate(key = to_key(GeneID),
+                  sig = !is.na(FDR) & FDR < HC_FDR & abs(dPSI) > HC_DPSI) %>%
+    dplyr::filter(!is.na(key), !is.na(dPSI)) %>%
+    dplyr::group_by(key) %>%
+    dplyr::arrange(dplyr::desc(sig), dplyr::desc(abs(dPSI)), .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(key, geneSymbol, EventType, FDR, dPSI, sig)
+}
+
+# --- 3. DESeq2 log2FC hozzárendelése (TIS - CTR) ---
+attach_lfc <- function(g, cell) {
+  d <- dge[[cell]][[HC_CMP]]
+  g %>%
+    dplyr::mutate(log2FC     = d$log2FC[match(key, d$key)],
+                  Gene_Name  = dplyr::coalesce(unname(KEY2SYM[key]), geneSymbol)) %>%
+    dplyr::filter(!is.na(log2FC))
+}
+
+ref_all <- attach_lfc(gene_level(read_rmats_events(REF_CELL)), REF_CELL)
+tgt_all <- attach_lfc(gene_level(read_rmats_events(TGT_CELL)), TGT_CELL)
+
+# --- 4. high-confidence gének: rMATS ÉS LeafCutter az MCF7-ben (konszenzus DAS) ---
+hc_keys <- get_das(REF_CELL, HC_CMP, "consensus")$sig
+
+ref_hc <- ref_all %>% dplyr::filter(key %in% hc_keys) %>%
+  dplyr::mutate(dPSI_ref = dPSI)
+tgt_hc <- tgt_all %>% dplyr::filter(key %in% ref_hc$key) %>%
+  dplyr::mutate(dPSI_ref = ref_hc$dPSI_ref[match(key, ref_hc$key)])
+
+ref_bg <- ref_all %>% dplyr::filter(sig, !key %in% ref_hc$key)
+tgt_bg <- tgt_all %>% dplyr::filter(sig, !key %in% tgt_hc$key)
+
+# közös gének a 3. panelhez
+conc <- dplyr::inner_join(
+  ref_hc %>% dplyr::select(key, Gene_Name, dPSI_ref),
+  tgt_hc %>% dplyr::select(key, dPSI_tgt = dPSI), by = "key")
+
+n_hc  <- nrow(conc)
+r_p   <- cor(conc$dPSI_ref, conc$dPSI_tgt, method = "pearson")
+rho_s <- cor(conc$dPSI_ref, conc$dPSI_tgt, method = "spearman")
+same  <- 100 * mean(sign(conc$dPSI_ref) == sign(conc$dPSI_tgt))
+
+# a címkézendő top gének (a pontok mind megmaradnak, csak a felirat korlátozott)
+score <- switch(LABEL_BY,
+                ref  = abs(conc$dPSI_ref),
+                mean = (abs(conc$dPSI_ref) + abs(conc$dPSI_tgt)) / 2,
+                min  = pmin(abs(conc$dPSI_ref), abs(conc$dPSI_tgt)),
+                stop("Ismeretlen LABEL_BY: ", LABEL_BY))
+lab_keys <- conc$key[order(score, decreasing = TRUE)][seq_len(min(N_LABEL, n_hc))]
+cat("Címkézett gének:", paste(conc$Gene_Name[match(lab_keys, conc$key)], collapse = ", "), "\n")
+
+cat(sprintf("High-confidence gének MCF7-ben: %d | T47D-ben is mérhető: %d | Pearson r = %.2f | Spearman rho = %.2f | azonos irány = %.1f%%\n",
+            nrow(ref_hc), n_hc, r_p, rho_s, same))
+write.csv(conc, "high_confidence_concordance_genes.csv", row.names = FALSE)
+
+# --- 5. ábrák ---
+col_scale <- scale_color_gradient2(
+  low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+  limits = c(-COL_LIM, COL_LIM), oob = scales::squish, name = "MCF7 dPSI",
+  guide = guide_colorbar(barheight = grid::unit(5, "cm")))
+
+th <- theme_classic(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 9.5, colour = "grey25"),
+        axis.title    = element_text(face = "bold"))
+
+wrap <- function(x) stringr::str_wrap(x, 48)
+lab_args <- list(size = 3.4, max.overlaps = Inf, min.segment.length = 0,
+                 segment.colour = "grey40", segment.size = 0.3,
+                 box.padding = 0.45, point.padding = 0.2, seed = 1)
+
+p1 <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(data = ref_bg, aes(log2FC, dPSI), colour = "grey80", alpha = 0.6, size = 1.6) +
+  geom_point(data = ref_hc, aes(log2FC, dPSI, colour = dPSI_ref), size = 3.2) +
+  do.call(geom_text_repel, c(list(data = dplyr::filter(ref_hc, key %in% lab_keys), mapping = aes(log2FC, dPSI, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(title = "MCF7 reference",
+       subtitle = wrap(sprintf("Gray = all significant rMATS genes; colored = rMATS + LeafCutter supported (n = %d)", nrow(ref_hc))),
+       x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") +
+  th
+
+p2 <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(data = tgt_bg, aes(log2FC, dPSI), colour = "grey25", alpha = 0.6, size = 1.6) +
+  geom_point(data = tgt_hc, aes(log2FC, dPSI, colour = dPSI_ref), size = 3.2) +
+  do.call(geom_text_repel, c(list(data = dplyr::filter(tgt_hc, key %in% lab_keys), mapping = aes(log2FC, dPSI, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(title = "T47D transferred genes",
+       subtitle = wrap("Black = T47D background; colored genes inherit their MCF7 dPSI color"),
+       x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") +
+  th
+
+lim <- ceiling(max(abs(c(conc$dPSI_ref, conc$dPSI_tgt))) * 20) / 20 + 0.05   # szimmetrikus, 0.05-re kerekített határ
+stat_txt <- sprintf("High-confidence genes = %d\nPearson r = %.2f\nSpearman rho = %.2f\nSame direction = %.1f%%",
+                    n_hc, r_p, rho_s, same)
+
+p3 <- ggplot(conc, aes(dPSI_ref, dPSI_tgt)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey35") +
+  geom_point(aes(colour = dPSI_ref), size = 3.2) +
+  do.call(geom_text_repel, c(list(data = dplyr::filter(conc, key %in% lab_keys), mapping = aes(label = Gene_Name)), lab_args)) +
+  annotate("text", x = -lim, y = lim, label = stat_txt, hjust = 0, vjust = 1, size = 3.6, lineheight = 1.15) +
+  col_scale +
+  scale_x_continuous(limits = c(-lim, lim)) + scale_y_continuous(limits = c(-lim, lim)) +
+  labs(title = "Cross-cell-line splicing concordance",
+       subtitle = wrap("rMATS + LeafCutter-supported shared genes"),
+       x = "MCF7 dPSI", y = "T47D dPSI") +
+  th + theme(aspect.ratio = 1)
+
+fig_hc <- (p1 | p2 | p3) +
+  patchwork::plot_layout(guides = "collect") +
+  patchwork::plot_annotation(
+    title    = "High-confidence TIS-associated splicing concordance",
+    subtitle = "x = differential-expression log2FC; y = rMATS dPSI; highlighted genes are independently supported by rMATS and LeafCutter; top genes labeled",
+    theme = theme(plot.title = element_text(face = "bold", size = 17),
+                  plot.subtitle = element_text(size = 11)))
+
+print(fig_hc)
+ggsave("high_confidence_splicing_concordance.png", fig_hc, width = 17, height = 6.2, dpi = 300, bg = "white")
+```
+## 6.9 Konkordancia érzékenységvizsgálata
+
+Az MCF7 → T47D konkordancia függ attól, hogy (i) mi számít high-confidence génnek, (ii) génenként melyik rMATS eseményt vesszük,
+(iii) a T47D-ben bármelyik eseményt elfogadjuk-e, vagy csak a szignifikánsat, és (iv) mekkora MCF7 |dPSI| alatt dobjuk el a géneket.
+**Az összes kombinációt** megmutatjuk (nem csak a legjobbat), egzakt binomiális teszttel az 50%-os véletlen ellen
+(H0: az irány véletlenszerű), Clopper–Pearson 95%-os CI-vel és BH-korrekcióval a rácson belül.
+Az elsődleges eredmény a 6.8 fejezet beállítása (`consensus`, `max_dpsi`, `any`, `min_ref = 0.1`); a többi csak a robusztusságot mutatja.
+
+Az eseményt a 6.8-ban beolvasott `read_rmats_events()` adja, a `HC_*`, `REF_CELL`, `TGT_CELL` változókat is onnan használjuk.
+
+```{r concordance_sensitivity, fig.width=11, fig.height=7}
+ev_ref <- read_rmats_events(REF_CELL)
+ev_tgt <- read_rmats_events(TGT_CELL)
+
+# gén szintű dPSI; rule = "max_dpsi" (szignifikáns, legnagyobb |dPSI|) vagy "min_fdr" (szignifikáns, legkisebb FDR)
+gl <- function(ev, rule) {
+  x <- ev %>%
+    dplyr::mutate(key = to_key(GeneID),
+                  sig = !is.na(FDR) & FDR < HC_FDR & abs(dPSI) > HC_DPSI) %>%
+    dplyr::filter(!is.na(key), !is.na(dPSI), !is.na(FDR)) %>%
+    dplyr::group_by(key)
+  x <- if (rule == "max_dpsi") dplyr::arrange(x, dplyr::desc(sig), dplyr::desc(abs(dPSI)), .by_group = TRUE)
+       else                    dplyr::arrange(x, dplyr::desc(sig), FDR, dplyr::desc(abs(dPSI)), .by_group = TRUE)
+  x %>% dplyr::slice(1) %>% dplyr::ungroup() %>% dplyr::select(key, dPSI, sig)
+}
+
+conc_stats <- function(source, rule, tgt_req, min_ref) {
+  hc <- get_das(REF_CELL, HC_CMP, source)$sig
+  r  <- gl(ev_ref, rule) %>% dplyr::filter(key %in% hc, abs(dPSI) >= min_ref)
+  t  <- gl(ev_tgt, rule)
+  if (tgt_req == "tgt_sig") t <- dplyr::filter(t, sig)
+  j  <- dplyr::inner_join(dplyr::select(r, key, x = dPSI), dplyr::select(t, key, y = dPSI), by = "key")
+  n  <- nrow(j)
+  out <- data.frame(source = source, rule = rule, tgt_req = tgt_req, min_ref = min_ref, n_hc_ref = nrow(r),
+                    n = n, k_same = NA_integer_, pct_same = NA_real_, ci_lo = NA_real_, ci_hi = NA_real_,
+                    binom_p = NA_real_, pearson = NA_real_, spearman = NA_real_, stringsAsFactors = FALSE)
+  if (n < 3) return(out)
+  k  <- sum(sign(j$x) == sign(j$y))
+  bt <- binom.test(k, n, p = 0.5)
+  out$k_same <- k; out$pct_same <- 100 * k / n
+  out$ci_lo <- 100 * bt$conf.int[1]; out$ci_hi <- 100 * bt$conf.int[2]; out$binom_p <- bt$p.value
+  out$pearson  <- cor(j$x, j$y, method = "pearson")
+  out$spearman <- cor(j$x, j$y, method = "spearman")
+  out
+}
+
+grid <- expand.grid(source  = c("consensus", "union", "rmats", "leafcutter"),
+                    rule    = c("max_dpsi", "min_fdr"),
+                    tgt_req = c("any", "tgt_sig"),
+                    min_ref = c(0.1, 0.2), stringsAsFactors = FALSE)
+sens_conc <- dplyr::bind_rows(lapply(seq_len(nrow(grid)), function(i)
+  conc_stats(grid$source[i], grid$rule[i], grid$tgt_req[i], grid$min_ref[i])))
+sens_conc$binom_padj <- p.adjust(sens_conc$binom_p, "BH")
+write.csv(sens_conc, "concordance_sensitivity.csv", row.names = FALSE)
+
+DT::datatable(sens_conc %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))),
+              filter = "top", rownames = FALSE, extensions = "Buttons",
+              options = list(dom = "Bfrtip", buttons = c("excel", "csv"), pageLength = 12, scrollX = TRUE),
+              caption = "Konkordancia érzékenységvizsgálat. pct_same = azonos irányú gének aránya; binom_p: egzakt teszt az 50% ellen.")
+
+# forest plot: az összes variáns, CI-vel; a szaggatott vonal a véletlen (50%)
+pd <- sens_conc %>%
+  dplyr::filter(!is.na(pct_same)) %>%
+  dplyr::mutate(label = sprintf("%s | %s | min|dPSI|=%s (n=%d)", source, rule, min_ref, n),
+                label = factor(label, levels = rev(unique(label))),
+                tgt_req = factor(tgt_req, levels = c("any", "tgt_sig"),
+                                 labels = c("T47D: any event", "T47D: significant only")))
+
+p_sens <- ggplot(pd, aes(pct_same, label, colour = source)) +
+  geom_vline(xintercept = 50, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(aes(xmin = ci_lo, xmax = ci_hi), size = 0.35) +
+  facet_wrap(~ tgt_req, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(x = "Same direction in T47D (%, 95% CI)", y = NULL, colour = "MCF7 gene set",
+       title = "Sensitivity of cross-cell-line concordance",
+       subtitle = "All parameter combinations shown; dashed line = chance (50%)") +
+  theme_minimal(base_size = 10) + theme(plot.title = element_text(face = "bold"))
+print(p_sens)
+ggsave("concordance_sensitivity.png", p_sens, width = 11, height = 8, dpi = 300, bg = "white")
+```
+## 6.10 Eseményillesztett konkordancia (ugyanaz a genomi esemény MCF7-ben és T47D-ben)
+
+A 6.8–6.9 génenként egy-egy eseményt hasonlított össze, ami a két sejtvonalban nem feltétlenül ugyanaz az esemény
+(pl. az egyikben SE, a másikban RI). Itt az eseményeket **koordináták alapján illesztjük** (`Event_ID` = típus + chr + szál + koordináták,
+mint a `plot_splice_and_expression_3cond`-ban), és csak ugyanazt az eseményt hasonlítjuk össze.
+
+* Az MCF7 oldalon az eseményeknek szignifikánsnak kell lenniük (FDR + |dPSI| küszöb), és a high-confidence gének egyikéhez kell tartozniuk.
+* `level = "event"`: minden illeszthető esemény külön számít (egy génből több is lehet, ezért a binomiális teszt itt optimista).
+* `level = "gene_best"`: génenként az az illeszthető esemény, amelynek az **MCF7** FDR-je a legkisebb (a választás csak az MCF7 adatán alapul, így nem torzít a konkordancia felé). Ez a konzervatív, elsődleges szint.
+* A `match_pct` megmutatja, az MCF7 szignifikáns eseményeinek hány %-a található meg azonos ID-val a T47D rMATS eredményében.
+
+Futtatás előtt a 6.8 és 6.9 chunkoknak le kell futniuk (`EV_TYPES`, `HC_FDR`, `HC_DPSI`, `REF_CELL`, `TGT_CELL`, `HC_CMP`, `sens_conc`).
+
+```{r concordance_event_matched, fig.width=11, fig.height=6.5}
+read_rmats_events_id <- function(cell, cmp = HC_CMP) {
+  dir <- file.path(RMATS_BASE_DIR, cell, cmp, "output")
+  ev <- dplyr::bind_rows(lapply(EV_TYPES, function(et) {
+    f <- file.path(dir, paste0(et, ".MATS.JC.txt"))
+    if (!file.exists(f)) return(NULL)
+    d <- read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(d), value = TRUE)
+    pos <- do.call(paste, c(d[coord_cols], sep = "-"))
+    data.frame(Event_ID = paste(et, d$chr, d$strand, pos, sep = "_"), EventType = et,
+               GeneID = d$GeneID, FDR = as.numeric(d$FDR),
+               dPSI = -as.numeric(d$IncLevelDifference), stringsAsFactors = FALSE)
+  }))
+  ev %>%
+    dplyr::mutate(key = to_key(GeneID),
+                  sig = !is.na(FDR) & FDR < HC_FDR & abs(dPSI) > HC_DPSI) %>%
+    dplyr::filter(!is.na(dPSI), !is.na(FDR)) %>%
+    dplyr::arrange(FDR, dplyr::desc(abs(dPSI))) %>%
+    dplyr::distinct(Event_ID, .keep_all = TRUE)
+}
+
+ev_ref_id <- read_rmats_events_id(REF_CELL)
+ev_tgt_id <- read_rmats_events_id(TGT_CELL)
+cat(sprintf("Események: %s = %d | %s = %d | közös Event_ID: %d\n",
+            toupper(REF_CELL), nrow(ev_ref_id), toupper(TGT_CELL), nrow(ev_tgt_id),
+            length(intersect(ev_ref_id$Event_ID, ev_tgt_id$Event_ID))))
+
+matched_stats <- function(source, tgt_req, min_ref, level) {
+  hc <- get_das(REF_CELL, HC_CMP, source)$sig
+  r  <- ev_ref_id %>%
+    dplyr::filter(sig, key %in% hc, abs(dPSI) >= min_ref) %>%
+    dplyr::select(Event_ID, key, FDR_r = FDR, x = dPSI)
+  t  <- ev_tgt_id %>% dplyr::select(Event_ID, y = dPSI, sig_t = sig)
+  j  <- dplyr::inner_join(r, t, by = "Event_ID")
+  n_match_any <- nrow(j)
+  if (tgt_req == "tgt_sig") j <- dplyr::filter(j, sig_t)
+  if (level == "gene_best")
+    j <- j %>% dplyr::arrange(FDR_r, dplyr::desc(abs(x))) %>% dplyr::distinct(key, .keep_all = TRUE)
+  n <- nrow(j)
+  out <- data.frame(source = source, tgt_req = tgt_req, min_ref = min_ref, level = level,
+                    n_ref_events = nrow(r), n_matched_any = n_match_any,
+                    match_pct = ifelse(nrow(r) > 0, 100 * n_match_any / nrow(r), NA_real_),
+                    n = n, n_genes = dplyr::n_distinct(j$key), k_same = NA_integer_, pct_same = NA_real_,
+                    ci_lo = NA_real_, ci_hi = NA_real_, binom_p = NA_real_,
+                    pearson = NA_real_, spearman = NA_real_, stringsAsFactors = FALSE)
+  if (n >= 3) {
+    k  <- sum(sign(j$x) == sign(j$y)); bt <- binom.test(k, n, p = 0.5)
+    out$k_same <- k; out$pct_same <- 100 * k / n
+    out$ci_lo <- 100 * bt$conf.int[1]; out$ci_hi <- 100 * bt$conf.int[2]; out$binom_p <- bt$p.value
+    out$pearson <- cor(j$x, j$y); out$spearman <- cor(j$x, j$y, method = "spearman")
+  }
+  list(stats = out, data = j)
+}
+
+grid_m <- expand.grid(source  = c("consensus", "union", "rmats", "leafcutter"),
+                      tgt_req = c("any", "tgt_sig"),
+                      min_ref = c(0.1, 0.2),
+                      level   = c("gene_best", "event"), stringsAsFactors = FALSE)
+sens_match <- dplyr::bind_rows(lapply(seq_len(nrow(grid_m)), function(i)
+  matched_stats(grid_m$source[i], grid_m$tgt_req[i], grid_m$min_ref[i], grid_m$level[i])$stats))
+sens_match$binom_padj <- p.adjust(sens_match$binom_p, "BH")
+
+# összevetés a nem illesztett (génszintű, min_fdr) eredménnyel a 6.9-ből
+if (exists("sens_conc")) {
+  old <- sens_conc %>% dplyr::filter(rule == "min_fdr") %>%
+    dplyr::select(source, tgt_req, min_ref, pct_same_unmatched = pct_same, spearman_unmatched = spearman)
+  sens_match <- dplyr::left_join(sens_match, old, by = c("source", "tgt_req", "min_ref"))
+}
+write.csv(sens_match, "concordance_event_matched.csv", row.names = FALSE)
+
+DT::datatable(sens_match %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3))),
+              filter = "top", rownames = FALSE, extensions = "Buttons",
+              options = list(dom = "Bfrtip", buttons = c("excel", "csv"), pageLength = 12, scrollX = TRUE),
+              caption = "Eseményillesztett konkordancia. match_pct: az MCF7 szignifikáns eseményeinek hány %-a van meg a T47D-ben azonos Event_ID-vel.")
+
+# forest plot
+pd <- sens_match %>%
+  dplyr::filter(!is.na(pct_same)) %>%
+  dplyr::mutate(label = sprintf("%s | min|dPSI|=%s (n=%d)", source, min_ref, n),
+                label = factor(label, levels = rev(unique(label))),
+                panel = paste0(ifelse(level == "gene_best", "gene-best event", "all events"), " | ",
+                               ifelse(tgt_req == "any", "T47D any", "T47D significant")))
+p_match <- ggplot(pd, aes(pct_same, label, colour = source)) +
+  geom_vline(xintercept = 50, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(aes(xmin = ci_lo, xmax = ci_hi), size = 0.3) +
+  facet_wrap(~ panel, scales = "free_y", ncol = 2) +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(x = "Same direction, same event (%, 95% CI)", y = NULL, colour = "MCF7 gene set",
+       title = "Event-matched cross-cell-line concordance",
+       subtitle = "Dashed line = chance (50%); 'all events' CIs are optimistic (several events per gene)") +
+  theme_minimal(base_size = 9) + theme(plot.title = element_text(face = "bold"))
+print(p_match)
+ggsave("concordance_event_matched_forest.png", p_match, width = 11, height = 9, dpi = 300, bg = "white")
+
+# az elsődleges beállítás szóródási ábrája (consensus, T47D any, min|dPSI| >= 0.1, gene_best)
+prim <- matched_stats("consensus", "any", 0.1, "gene_best")
+sc <- prim$data
+st <- prim$stats
+p_sc <- ggplot(sc, aes(x, y)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey35") +
+  geom_point(aes(colour = x), alpha = 0.6, size = 1.8) +
+  scale_color_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+                        limits = c(-COL_LIM, COL_LIM), oob = scales::squish, name = "MCF7 dPSI") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.2, size = 3.6, lineheight = 1.15,
+           label = sprintf("Matched events (genes) = %d\nSame direction = %.1f%% [%.1f-%.1f]\nPearson r = %.2f\nSpearman rho = %.2f",
+                           st$n, st$pct_same, st$ci_lo, st$ci_hi, st$pearson, st$spearman)) +
+  labs(x = "MCF7 dPSI (TIS - CTR)", y = "T47D dPSI (TIS - CTR)",
+       title = "Same-event splicing concordance",
+       subtitle = "High-confidence MCF7 genes (rMATS + LeafCutter); best-FDR matched event per gene") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), axis.title = element_text(face = "bold"), aspect.ratio = 1)
+print(p_sc)
+ggsave("concordance_event_matched_scatter.png", p_sc, width = 6.5, height = 6.5, dpi = 300, bg = "white")
+```
+
+## 6.11 Magas konfidenciájú TIS-asszociált splicing konkordancia (eseményillesztett, végleges ábra)
+
+Ez a 6.8 ábra eseményillesztett változata. A három panel **ugyanazt a génhalmazt** mutatja:
+az MCF7-ben rMATS ÉS LeafCutter által támogatott (konszenzus DAS) gének szignifikáns rMATS eseményei közül azok,
+amelyek **ugyanazzal az `Event_ID`-val (típus + chr + szál + koordináták) a T47D rMATS eredményében is megtalálhatók**.
+Génenként az az illeszthető esemény szerepel, amelynek az MCF7 FDR-je a legkisebb (a választás csak az MCF7 adatán alapul).
+
+* 1. panel: MCF7 (szürke = az összes szignifikáns rMATS gén, színes = az illesztett high-confidence gének, szín = MCF7 dPSI).
+* 2. panel: ugyanezek az események a T47D-ben (fekete = T47D szignifikáns rMATS háttér, a színes pontok megtartják az MCF7 dPSI színüket).
+* 3. panel: MCF7 dPSI vs T47D dPSI ugyanarra az eseményre, statisztikával (azonos irány + egzakt 95% CI, Pearson, Spearman).
+
+Önálló chunk: a 6.8–6.10 chunkok nélkül is lefut, csak a korábbi fejezetek objektumai kellenek
+(`dge`, `get_das`, `to_key`, `KEY2SYM`, `RMATS_BASE_DIR`). A feliratok csak a top gének kapják, a pontok mind megmaradnak.
+
+```{r hc_event_matched_figure, fig.width=17, fig.height=6.2}
+suppressPackageStartupMessages(library(ggrepel))
+
+# ====== ÁLLÍTSD BE ======
+HC_CMP    <- "CTR_vs_TIS"
+REF_CELL  <- "mcf7"
+TGT_CELL  <- "t47d"
+HC_SOURCE <- "consensus"                                        # rMATS ÉS LeafCutter az MCF7-ben
+HC_FDR    <- get0("SIG_THRESHOLD",  ifnotfound = 0.05)
+HC_DPSI   <- get0("DPSI_THRESHOLD", ifnotfound = 0.1)
+MIN_REF   <- 0.1                                                # minimum MCF7 |dPSI| az illesztett eseményekre
+EV_TYPES  <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+COL_LIM   <- 0.4                                                # színskála +-határa
+N_LABEL   <- 12                                                 # Érdemes 12-re állítani (4-4-4 kategóriánként)
+MIN_LABEL_JC <- 100                                             # ÚJ: Minimum átlagos junction count a szép sashimihez
+# =========================
+
+# --- 1. rMATS események Event_ID-val (dPSI = TIS - CTR = -IncLevelDifference) ---
+read_rmats_events_id <- function(cell, cmp = HC_CMP) {
+  dir <- file.path(RMATS_BASE_DIR, cell, cmp, "output")
+  ev <- dplyr::bind_rows(lapply(EV_TYPES, function(et) {
+    f <- file.path(dir, paste0(et, ".MATS.JC.txt"))
+    if (!file.exists(f)) return(NULL)
+    
+    d <- read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+    if (nrow(d) == 0) return(NULL) # Biztonsági ellenőrzés üres fájlokra
+    
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(d), value = TRUE)
+    pos <- do.call(paste, c(d[coord_cols], sep = "-"))
+    
+    # JAVÍTÁS: Biztonságos vapply és Helyes oszlopnevek (SAMPLE_1, SAMPLE_2)
+    calc_mean_jc <- function(col) {
+      if (is.null(col) || length(col) == 0) return(numeric(nrow(d)))
+      vapply(strsplit(as.character(col), ","), function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+    }
+    
+    tot_jc <- calc_mean_jc(d$IJC_SAMPLE_1) + calc_mean_jc(d$SJC_SAMPLE_1) + 
+              calc_mean_jc(d$IJC_SAMPLE_2) + calc_mean_jc(d$SJC_SAMPLE_2)
+              
+    data.frame(Event_ID = paste(et, d$chr, d$strand, pos, sep = "_"), EventType = et,
+               GeneID = d$GeneID, geneSymbol = d$geneSymbol,
+               FDR = as.numeric(d$FDR), dPSI = -as.numeric(d$IncLevelDifference),
+               Total_JC = tot_jc,
+               stringsAsFactors = FALSE)
+  }))
+  
+  if (nrow(ev) == 0) return(ev) # Ha egyáltalán nincs esemény
+  
+  ev %>%
+    dplyr::mutate(key = to_key(GeneID),
+                  sig = !is.na(FDR) & FDR < HC_FDR & abs(dPSI) > HC_DPSI) %>%
+    dplyr::filter(!is.na(dPSI), !is.na(FDR), !is.na(key)) %>%
+    dplyr::arrange(FDR, dplyr::desc(abs(dPSI))) %>%
+    dplyr::distinct(Event_ID, .keep_all = TRUE)
+}
+
+# 1. Futtasd le az új, javított read_rmats_events_id függvényt
+
+# 2. Hozd létre újra a táblákat, hogy belekerüljön a Total_JC oszlop:
+ev_ref <- read_rmats_events_id(REF_CELL)
+ev_tgt <- read_rmats_events_id(TGT_CELL)
+
+# 3. Frissítsd a ref_hc_ev táblát (mert ez is az ev_ref-ből épül):
+ref_hc_ev <- ev_ref %>% dplyr::filter(sig, key %in% hc_keys, abs(dPSI) >= MIN_REF)
+
+# 4. Most már hiba nélkül le fog futni a select() és az inner_join():
+matched <- ref_hc_ev %>%
+  dplyr::select(Event_ID, key, geneSymbol, EventType, FDR_ref = FDR, dPSI_ref = dPSI, JC_ref = Total_JC) %>%
+  dplyr::inner_join(ev_tgt %>% dplyr::select(Event_ID, FDR_tgt = FDR, dPSI_tgt = dPSI, sig_tgt = sig, JC_tgt = Total_JC),
+                    by = "Event_ID") %>%
+  dplyr::arrange(FDR_ref, dplyr::desc(abs(dPSI_ref))) %>%
+  dplyr::distinct(key, .keep_all = TRUE)
+
+# --- 2. DESeq2 log2FC (TIS - CTR) + génnév ---
+attach_lfc <- function(x, cell) {
+  d <- dge[[cell]][[HC_CMP]]
+  x %>% dplyr::mutate(log2FC    = d$log2FC[match(key, d$key)],
+                      Gene_Name = dplyr::coalesce(unname(KEY2SYM[key]), geneSymbol)) %>%
+    dplyr::filter(!is.na(log2FC))
+}
+
+best_sig <- function(ev) ev %>% dplyr::filter(sig) %>%
+  dplyr::arrange(FDR, dplyr::desc(abs(dPSI))) %>% dplyr::distinct(key, .keep_all = TRUE)
+
+# --- 3. high-confidence + illesztés ---
+hc_keys <- get_das(REF_CELL, HC_CMP, HC_SOURCE)$sig
+
+# log2FC mindkét sejtvonalból
+lfc <- function(cell) { d <- dge[[cell]][[HC_CMP]]; setNames(d$log2FC, d$key) }
+matched <- matched %>%
+  dplyr::mutate(lfc_ref = unname(lfc(REF_CELL)[key]), lfc_tgt = unname(lfc(TGT_CELL)[key]),
+                Gene_Name = dplyr::coalesce(unname(KEY2SYM[key]), geneSymbol)) %>%
+  dplyr::filter(!is.na(lfc_ref), !is.na(lfc_tgt))
+
+n_m   <- nrow(matched)
+k_m   <- sum(sign(matched$dPSI_ref) == sign(matched$dPSI_tgt))
+bt    <- binom.test(k_m, n_m, p = 0.5)
+pct   <- 100 * k_m / n_m
+r_p   <- cor(matched$dPSI_ref, matched$dPSI_tgt)
+rho_s <- cor(matched$dPSI_ref, matched$dPSI_tgt, method = "spearman")
+
+cat(sprintf(paste0("MCF7 szignifikáns high-confidence események: %d | illeszthető a T47D-ben (Event_ID): %d (%.1f%%)\n",
+                   "Illesztett gének (DGE-vel is): %d | azonos irány: %d/%d = %.1f%% [95%% CI %.1f-%.1f], binomiális p = %.2g\n",
+                   "Pearson r = %.2f | Spearman rho = %.2f\n"),
+            nrow(ref_hc_ev),
+            sum(ref_hc_ev$Event_ID %in% ev_tgt$Event_ID), 100 * mean(ref_hc_ev$Event_ID %in% ev_tgt$Event_ID),
+            n_m, k_m, n_m, pct, 100 * bt$conf.int[1], 100 * bt$conf.int[2], bt$p.value, r_p, rho_s))
+write.csv(matched, "high_confidence_event_matched_genes.csv", row.names = FALSE)
+
+# --- 4. adatok a panelekhez ---
+ref_bg <- best_sig(ev_ref) %>% attach_lfc(REF_CELL) %>% dplyr::filter(!key %in% matched$key)
+tgt_bg <- best_sig(ev_tgt) %>% attach_lfc(TGT_CELL) %>% dplyr::filter(!key %in% matched$key)
+
+# --- OKOS CÍMKÉZÉS: DGE és DAS diverzitás + MÉLYSÉG (Coverage) alapján ---
+
+# 1. Először kiszűrjük azokat a géneket a "jelöltek" közül, amiknél túl kevés a read (sashimin rondák)
+label_pool <- matched %>% 
+  dplyr::filter(JC_ref >= MIN_LABEL_JC & JC_tgt >= MIN_LABEL_JC)
+
+# Biztonsági háló: ha a szűrés miatt extrém kevés maradna, lazítunk rajta
+if(nrow(label_pool) < N_LABEL) {
+  label_pool <- matched %>% dplyr::arrange(dplyr::desc(JC_ref + JC_tgt)) %>% head(N_LABEL * 2)
+}
+
+mean_abs_dpsi <- (abs(label_pool$dPSI_ref) + abs(label_pool$dPSI_tgt)) / 2
+mean_abs_lfc  <- (abs(label_pool$lfc_ref) + abs(label_pool$lfc_tgt)) / 2
+
+score_das_only <- mean_abs_dpsi / (mean_abs_lfc + 0.1)
+score_dge_only <- mean_abs_lfc / (mean_abs_dpsi + 0.05)
+score_both     <- mean_abs_dpsi * mean_abs_lfc
+
+n_per_cat <- ceiling(N_LABEL / 3)
+keys_das_only <- label_pool$key[order(score_das_only, decreasing = TRUE)][seq_len(min(n_per_cat, nrow(label_pool)))]
+keys_dge_only <- label_pool$key[order(score_dge_only, decreasing = TRUE)][seq_len(min(n_per_cat, nrow(label_pool)))]
+keys_both     <- label_pool$key[order(score_both, decreasing = TRUE)][seq_len(min(n_per_cat, nrow(label_pool)))]
+
+lab_keys <- unique(c(keys_das_only, keys_dge_only, keys_both))
+lab_keys <- head(lab_keys, N_LABEL) 
+lab <- dplyr::filter(matched, key %in% lab_keys)
+cat("Címkézett (magas lefedettségű) gének:", paste(lab$Gene_Name, collapse = ", "), "\n")
+# ----------------------------------------------------
+
+# --- 5. ábrák (CÍMEK ÉS ALCÍMEK NÉLKÜL, CSAK A, B, C PANELEK ELTÁVOLÍTVA) ---
+col_scale <- scale_color_gradient2(
+  low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+  limits = c(-COL_LIM, COL_LIM), oob = scales::squish, name = "MCF7 dPSI",
+  guide = guide_colorbar(
+    barheight = grid::unit(6, "cm"), 
+    barwidth = grid::unit(1, "cm")   
+  )
+)
+
+th <- theme_classic(base_size = 20) + 
+  theme(axis.title    = element_text(face = "bold", size = 20),
+        axis.text     = element_text(size = 18),               
+        legend.title  = element_text(face = "bold", size = 20),
+        legend.text   = element_text(size = 18))               
+
+lab_args <- list(size = 4.5, max.overlaps = Inf, min.segment.length = 0,
+                 segment.colour = "grey40", segment.size = 0.3,
+                 box.padding = 0.45, point.padding = 0.2, seed = 1)
+guides0 <- list(geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55"),
+                geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55"))
+
+p1 <- ggplot() + guides0 +
+  geom_point(data = ref_bg, aes(log2FC, dPSI), colour = "grey80", alpha = 0.6, size = 1.5) +
+  geom_point(data = matched, aes(lfc_ref, dPSI_ref, colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(lfc_ref, dPSI_ref, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") + th
+
+p2 <- ggplot() + guides0 +
+  geom_point(data = tgt_bg, aes(log2FC, dPSI), colour = "grey80", alpha = 0.6, size = 1.5) +
+  geom_point(data = matched, aes(lfc_tgt, dPSI_tgt, colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(lfc_tgt, dPSI_tgt, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") + th
+
+lim <- ceiling(max(abs(c(matched$dPSI_ref, matched$dPSI_tgt))) * 20) / 20 + 0.05
+stat_txt <- sprintf("Matched events (genes) = %d\nSame direction = %.1f%%",
+                    n_m, pct)
+
+p3 <- ggplot(matched, aes(dPSI_ref, dPSI_tgt)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey35") +
+  geom_point(aes(colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(label = Gene_Name)), lab_args)) +
+  annotate("text", x = -lim, y = lim, label = stat_txt, hjust = 0, vjust = 1, size = 4.5, lineheight = 1.15, fontface="bold") +
+  col_scale +
+  scale_x_continuous(limits = c(-lim, lim)) + scale_y_continuous(limits = c(-lim, lim)) +
+  labs(x = "MCF7 dPSI", y = "T47D dPSI") +
+  th + theme(aspect.ratio = 1)
+
+# PATCHWORK ÖSSZEÁLLÍTÁS: Itt is kivettem az A, B, C annotációkat!
+fig_hc_m <- (p1 | p2 | p3) +
+  patchwork::plot_layout(guides = "collect")
+
+print(fig_hc_m)
+ggsave("high_confidence_splicing_concordance_event_matched_mcf7_to_t47d.png", fig_hc_m,
+       width = 18, height = 6.5, dpi = 300, bg = "white")
+```
+
+```{r}
+suppressPackageStartupMessages(library(ggrepel))
+
+# ====== ÁLLÍTSD BE ======
+HC_CMP    <- "CTR_vs_TIS"
+REF_CELL  <- "t47d"                                            
+TGT_CELL  <- "mcf7"                                            
+HC_SOURCE <- "consensus"                                       
+HC_FDR    <- get0("SIG_THRESHOLD",  ifnotfound = 0.05)
+HC_DPSI   <- get0("DPSI_THRESHOLD", ifnotfound = 0.1)
+MIN_REF   <- 0.1                                               
+EV_TYPES  <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+COL_LIM   <- 0.4                                               
+N_LABEL   <- 12                                                # Érdemes 12-re állítani (4-4-4 kategóriánként)
+# =========================
+
+# --- 1. rMATS események Event_ID-val (dPSI = TIS - CTR = -IncLevelDifference) ---
+read_rmats_events_id <- function(cell, cmp = HC_CMP) {
+  dir <- file.path(RMATS_BASE_DIR, cell, cmp, "output")
+  ev <- dplyr::bind_rows(lapply(EV_TYPES, function(et) {
+    f <- file.path(dir, paste0(et, ".MATS.JC.txt"))
+    if (!file.exists(f)) return(NULL)
+    d <- read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(d), value = TRUE)
+    pos <- do.call(paste, c(d[coord_cols], sep = "-"))
+    data.frame(Event_ID = paste(et, d$chr, d$strand, pos, sep = "_"), EventType = et,
+               GeneID = d$GeneID, geneSymbol = d$geneSymbol,
+               FDR = as.numeric(d$FDR), dPSI = -as.numeric(d$IncLevelDifference),
+               stringsAsFactors = FALSE)
+  }))
+  ev %>%
+    dplyr::mutate(key = to_key(GeneID),
+                  sig = !is.na(FDR) & FDR < HC_FDR & abs(dPSI) > HC_DPSI) %>%
+    dplyr::filter(!is.na(dPSI), !is.na(FDR), !is.na(key)) %>%
+    dplyr::arrange(FDR, dplyr::desc(abs(dPSI))) %>%
+    dplyr::distinct(Event_ID, .keep_all = TRUE)
+}
+ev_ref <- read_rmats_events_id(REF_CELL)
+ev_tgt <- read_rmats_events_id(TGT_CELL)
+
+# --- 2. DESeq2 log2FC (TIS - CTR) + génnév ---
+attach_lfc <- function(x, cell) {
+  d <- dge[[cell]][[HC_CMP]]
+  x %>% dplyr::mutate(log2FC    = d$log2FC[match(key, d$key)],
+                      Gene_Name = dplyr::coalesce(unname(KEY2SYM[key]), geneSymbol)) %>%
+    dplyr::filter(!is.na(log2FC))
+}
+
+# gének háttérhalmaza: génenként a legkisebb FDR-ű szignifikáns esemény
+best_sig <- function(ev) ev %>% dplyr::filter(sig) %>%
+  dplyr::arrange(FDR, dplyr::desc(abs(dPSI))) %>% dplyr::distinct(key, .keep_all = TRUE)
+
+# --- 3. high-confidence + illesztés ---
+hc_keys <- get_das(REF_CELL, HC_CMP, HC_SOURCE)$sig
+
+ref_hc_ev <- ev_ref %>% dplyr::filter(sig, key %in% hc_keys, abs(dPSI) >= MIN_REF)
+n_ref_events <- nrow(ref_hc_ev)
+
+matched <- ref_hc_ev %>%
+  dplyr::select(Event_ID, key, geneSymbol, EventType, FDR_ref = FDR, dPSI_ref = dPSI) %>%
+  dplyr::inner_join(ev_tgt %>% dplyr::select(Event_ID, FDR_tgt = FDR, dPSI_tgt = dPSI, sig_tgt = sig),
+                    by = "Event_ID") %>%
+  dplyr::arrange(FDR_ref, dplyr::desc(abs(dPSI_ref))) %>%
+  dplyr::distinct(key, .keep_all = TRUE)
+
+# log2FC mindkét sejtvonalból
+lfc <- function(cell) { d <- dge[[cell]][[HC_CMP]]; setNames(d$log2FC, d$key) }
+matched <- matched %>%
+  dplyr::mutate(lfc_ref = unname(lfc(REF_CELL)[key]), lfc_tgt = unname(lfc(TGT_CELL)[key]),
+                Gene_Name = dplyr::coalesce(unname(KEY2SYM[key]), geneSymbol)) %>%
+  dplyr::filter(!is.na(lfc_ref), !is.na(lfc_tgt))
+
+n_m   <- nrow(matched)
+k_m   <- sum(sign(matched$dPSI_ref) == sign(matched$dPSI_tgt))
+bt    <- binom.test(k_m, n_m, p = 0.5)
+pct   <- 100 * k_m / n_m
+r_p   <- cor(matched$dPSI_ref, matched$dPSI_tgt)
+rho_s <- cor(matched$dPSI_ref, matched$dPSI_tgt, method = "spearman")
+
+cat(sprintf(paste0("T47D szignifikáns high-confidence események: %d | illeszthető a MCF7-ben (Event_ID): %d (%.1f%%)\n",
+                   "Illesztett gének (DGE-vel is): %d | azonos irány: %d/%d = %.1f%% [95%% CI %.1f-%.1f], binomiális p = %.2g\n",
+                   "Pearson r = %.2f | Spearman rho = %.2f\n"),
+            n_ref_events,
+            sum(ref_hc_ev$Event_ID %in% ev_tgt$Event_ID), 100 * mean(ref_hc_ev$Event_ID %in% ev_tgt$Event_ID),
+            n_m, k_m, n_m, pct, 100 * bt$conf.int[1], 100 * bt$conf.int[2], bt$p.value, r_p, rho_s))
+write.csv(matched, "high_confidence_event_matched_genes_t47d_to_mcf7.csv", row.names = FALSE)
+
+# --- 4. adatok a panelekhez ---
+ref_bg <- best_sig(ev_ref) %>% attach_lfc(REF_CELL) %>% dplyr::filter(!key %in% matched$key)
+tgt_bg <- best_sig(ev_tgt) %>% attach_lfc(TGT_CELL) %>% dplyr::filter(!key %in% matched$key)
+
+# --- OKOS CÍMKÉZÉS: DGE és DAS diverzitás alapján ---
+# Kiszámoljuk az átlagos abszolút változásokat a két sejtvonalra a stabilitásért
+mean_abs_dpsi <- (abs(matched$dPSI_ref) + abs(matched$dPSI_tgt)) / 2
+mean_abs_lfc  <- (abs(matched$lfc_ref) + abs(matched$lfc_tgt)) / 2
+
+# Három kategória alapján pontozzuk a géneket:
+# 1. Magas DAS, szinte 0 DGE (osztunk a kis log2FC-vel, hogy felnagyítsuk)
+score_das_only <- mean_abs_dpsi / (mean_abs_lfc + 0.1)
+# 2. Magas DGE, alacsony DAS (a "fordítva" eset)
+score_dge_only <- mean_abs_lfc / (mean_abs_dpsi + 0.05)
+# 3. Magas mindkettő (szorzat)
+score_both     <- mean_abs_dpsi * mean_abs_lfc
+
+n_per_cat <- ceiling(N_LABEL / 3)
+keys_das_only <- matched$key[order(score_das_only, decreasing = TRUE)][seq_len(min(n_per_cat, n_m))]
+keys_dge_only <- matched$key[order(score_dge_only, decreasing = TRUE)][seq_len(min(n_per_cat, n_m))]
+keys_both     <- matched$key[order(score_both, decreasing = TRUE)][seq_len(min(n_per_cat, n_m))]
+
+# Összevonjuk, duplikátumokat szűrjük és a kért maximum darabszámra vágjuk
+lab_keys <- unique(c(keys_das_only, keys_dge_only, keys_both))
+lab_keys <- head(lab_keys, N_LABEL) 
+lab <- dplyr::filter(matched, key %in% lab_keys)
+cat("Címkézett gének:", paste(lab$Gene_Name, collapse = ", "), "\n")
+# ----------------------------------------------------
+
+# --- 5. ábrák (CÍMEK NÉLKÜL, CSAK A, B, C PANELEK) ---
+# Színskála legenda méretének növelése
+col_scale <- scale_color_gradient2(
+  low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+  limits = c(-COL_LIM, COL_LIM), oob = scales::squish, name = "T47D dPSI",
+  guide = guide_colorbar(
+    barheight = grid::unit(6, "cm"), 
+    barwidth = grid::unit(1, "cm")
+  )
+)
+
+# Téma betűméreteinek növelése (base_size = 14)
+th <- theme_classic(base_size = 20) + 
+  theme(axis.title    = element_text(face = "bold", size = 20),
+        axis.text     = element_text(size = 18),               
+        legend.title  = element_text(face = "bold", size = 20),
+        legend.text   = element_text(size = 18))               
+
+# Címkék méretének növelése (size 3.4 -> 4.5)
+lab_args <- list(size = 4.5, max.overlaps = Inf, min.segment.length = 0,
+                 segment.colour = "grey40", segment.size = 0.3,
+                 box.padding = 0.45, point.padding = 0.2, seed = 1)
+guides0 <- list(geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55"),
+                geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55"))
+
+# p1: Nincsenek címek, csak tengelyfeliratok (T47D referencia)
+p1 <- ggplot() + guides0 +
+  geom_point(data = ref_bg, aes(log2FC, dPSI), colour = "grey80", alpha = 0.6, size = 1.5) +
+  geom_point(data = matched, aes(lfc_ref, dPSI_ref, colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(lfc_ref, dPSI_ref, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") + th
+
+# p2: Nincsenek címek, csak tengelyfeliratok (MCF7 háttér)
+p2 <- ggplot() + guides0 +
+  geom_point(data = tgt_bg, aes(log2FC, dPSI), colour = "grey80", alpha = 0.6, size = 1.5) +
+  geom_point(data = matched, aes(lfc_tgt, dPSI_tgt, colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(lfc_tgt, dPSI_tgt, label = Gene_Name)), lab_args)) +
+  col_scale +
+  labs(x = "DESeq2 log2FC (TIS vs CTR)", y = "rMATS dPSI (TIS - CTR)") + th
+
+lim <- ceiling(max(abs(c(matched$dPSI_ref, matched$dPSI_tgt))) * 20) / 20 + 0.05
+stat_txt <- sprintf("Matched events (genes) = %d\nSame direction = %.1f%%",
+                    n_m, pct)
+
+# p3: Nincsenek címek, csak a statisztikai annotáció és tengelyfeliratok
+p3 <- ggplot(matched, aes(dPSI_ref, dPSI_tgt)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey35") +
+  geom_point(aes(colour = dPSI_ref), alpha = 0.85, size = 2.4) +
+  do.call(geom_text_repel, c(list(data = lab, mapping = aes(label = Gene_Name)), lab_args)) +
+  # Annotáció betűméretének növelése (size 4.5)
+  annotate("text", x = -lim, y = lim, label = stat_txt, hjust = 0, vjust = 1, size = 4.5, lineheight = 1.15, fontface="bold") +
+  col_scale +
+  scale_x_continuous(limits = c(-lim, lim)) + scale_y_continuous(limits = c(-lim, lim)) +
+  labs(x = "T47D dPSI", y = "MCF7 dPSI") + 
+  th + theme(aspect.ratio = 1)
+
+# PATCHWORK ÖSSZEÁLLÍTÁS: Itt kivettem az A, B, C annotációkat!
+fig_hc_m <- (p1 | p2 | p3) +
+  patchwork::plot_layout(guides = "collect")
+
+print(fig_hc_m)
+# A magasság itt is 6.5, hogy kényelmesen elférjenek a nagy betűk
+ggsave("high_confidence_splicing_concordance_event_matched_t47d_to_mcf7.png", fig_hc_m, 
+       width = 18, height = 6.5, dpi = 300, bg = "white")
+```
+
+
+```{r}
+for (cell in c("mcf7","t47d")) for (cmp in COMPARISONS) {
+  S <- splice_in[[cell]]
+  raw  <- length(intersect(S$rm_sig[[cmp]], S$lf_sig[[cmp]]))                  # szimbólum szerint
+  keyd <- length(intersect(to_key(S$rm_sig[[cmp]]), to_key(S$lf_sig[[cmp]])))  # Ensembl-kulcs szerint
+  cat(cell, cmp, "szimbólum:", raw, " kulcs:", keyd, "\n")
+}
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ==============================================================================
+# PSMB3 Expression-Weighted Splice plot generálása (-0.124 Delta PSI célzással)
+# ==============================================================================
+plot_psmb3_weighted <- function(cell = "mcf7", 
+                                target_dpsi = -0.124,
+                                out_dir = "expression_weighted_plots",
+                                save_plot = TRUE,
+                                width = 6.5, height = 6, dpi = 300) {
+  
+  cell <- tolower(cell)
+  cell_upper <- toupper(cell)
+  gene <- "PSMB3"
+  
+  # 1. Expresszió kinyerése a NORM objektumból (CTR, TIS, REPOP)
+  if (!cell %in% names(NORM)) stop("A megadott sejtvonal nincs a NORM objektumban: ", cell)
+  N <- NORM[[cell]]
+  gk <- to_key(gene)
+  
+  idx <- which(strip_ver(rownames(N$mat)) == gk)
+  if (length(idx) == 0) stop("A gén nem található az expressziós mátrixban: ", gene)
+  idx <- idx[which.max(rowMeans(N$mat[idx, , drop = FALSE]))]
+  
+  v <- N$mat[idx, ]
+  expr_ctr    <- mean(v[N$cd$Condition == "CTR"], na.rm = TRUE)
+  expr_tis    <- mean(v[N$cd$Condition == "TIS"], na.rm = TRUE)
+  expr_repop <- mean(v[N$cd$Condition == "REPOP"], na.rm = TRUE)
+  
+  # 2. rMATS esemény azonosítása (CTR_vs_TIS futtatásból)
+  rm_dir_tis <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_TIS", "output")
+  all_ev_types <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+  found_events <- list()
+  
+  for (ev in all_ev_types) {
+    f <- file.path(rm_dir_tis, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) next
+    raw_df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    match_rows <- raw_df[raw_df$geneSymbol == gene, ]
+    if (nrow(match_rows) > 0) {
+      match_rows$EventType <- ev
+      coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(match_rows), value = TRUE)
+      pos_vec <- apply(match_rows[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+      match_rows$Event_ID <- paste(ev, match_rows$chr, match_rows$strand, pos_vec, sep = "_")
+      found_events[[ev]] <- match_rows
+    }
+  }
+  
+  if (length(found_events) == 0) stop("A PSMB3-hoz nem található rMATS esemény.")
+  ev_df <- dplyr::bind_rows(found_events)
+  
+  # Kiválasztás a target_dpsi (-0.124) alapján
+  ev_top <- ev_df %>% 
+    dplyr::mutate(calc_dpsi = -as.numeric(IncLevelDifference)) %>% 
+    dplyr::arrange(abs(calc_dpsi - target_dpsi)) %>% 
+    dplyr::slice(1)
+  
+  ev_type_chosen <- ev_top$EventType
+  target_event_id <- ev_top$Event_ID
+  fdr_tis        <- as.numeric(ev_top$FDR)
+  dpsi_tis       <- -as.numeric(ev_top$IncLevelDifference)
+  
+  psi_ctr <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel1), ",")[[1]]), na.rm = TRUE)
+  psi_tis <- mean(as.numeric(strsplit(as.character(ev_top$IncLevel2), ",")[[1]]), na.rm = TRUE)
+  
+  # 3. REPOP PSI kinyerése a CTR_vs_REPOP fájlból ugyanarra az eseményre
+  rm_dir_repop <- file.path(RMATS_BASE_DIR, cell, "CTR_vs_REPOP", "output")
+  f_repop <- file.path(rm_dir_repop, paste0(ev_type_chosen, ".MATS.JC.txt"))
+  
+  psi_repop <- NA_real_
+  dpsi_repop <- NA_real_
+  fdr_repop <- NA_real_
+  
+  if (file.exists(f_repop)) {
+    raw_repop <- read.delim(f_repop, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(raw_repop), value = TRUE)
+    pos_vec <- apply(raw_repop[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+    raw_repop$Event_ID <- paste(ev_type_chosen, raw_repop$chr, raw_repop$strand, pos_vec, sep = "_")
+    
+    match_repop <- raw_repop[raw_repop$Event_ID == target_event_id, ]
+    if (nrow(match_repop) > 0) {
+      psi_repop  <- mean(as.numeric(strsplit(as.character(match_repop$IncLevel2[1]), ",")[[1]]), na.rm = TRUE)
+      dpsi_repop <- -as.numeric(match_repop$IncLevelDifference[1])
+      fdr_repop  <- as.numeric(match_repop$FDR[1])
+    }
+  }
+  
+  # 4. Adattábla felépítése
+  df_plot <- data.frame(
+    Condition = factor(c("CTR", "TIS", "REPOP"), levels = c("CTR", "TIS", "REPOP")),
+    Mean_Expr = c(expr_ctr, expr_tis, expr_repop),
+    PSI       = c(psi_ctr, psi_tis, psi_repop)
+  ) %>%
+    dplyr::mutate(
+      Inclusion_weighted   = Mean_Expr * PSI,
+      Alternative_weighted = Mean_Expr * (1 - PSI)
+    )
+  
+  df_weighted <- df_plot %>%
+    dplyr::select(Condition, Inclusion = Inclusion_weighted, Alternative = Alternative_weighted) %>%
+    tidyr::pivot_longer(cols = c("Alternative", "Inclusion"), names_to = "Usage", values_to = "Counts") %>%
+    dplyr::mutate(Usage = factor(Usage, levels = c("Alternative", "Inclusion")))
+  
+  splice_colors <- c("Inclusion" = "#D95F02", "Alternative" = "#1F78B4")
+  
+  # 5. Diagram elkészítése
+  title_text <- sprintf("%s %s | %s", cell_upper, gene, ev_type_chosen)
+  sub_text <- sprintf("Expression-weighted composition\nCTR\u2192TIS: \u0394PSI=%.3f (FDR=%.1e) | CTR\u2192REPOP: \u0394PSI=%.3f (FDR=%.1e)",
+                      dpsi_tis, fdr_tis, dpsi_repop, fdr_repop)
+  
+  p_weighted <- ggplot(df_weighted, aes(x = Condition, y = Counts, fill = Usage)) +
+    geom_col(position = "stack", width = 0.55, color = "grey30", linewidth = 0.2) +
+    scale_fill_manual(values = splice_colors, labels = c("Alternative usage", "Inclusion usage")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.08)), labels = scales::comma) +
+    labs(
+      title = title_text,
+      subtitle = sub_text,
+      x = NULL, 
+      y = "Mean normalized gene expression",
+      fill = "Local splice usage"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "grey20", lineheight = 1.2),
+      legend.position = "top",
+      legend.justification = "left",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5)
+    )
+  
+  # 6. Mentés
+  if (save_plot) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    out_filename <- file.path(out_dir, sprintf("expr_weighted_3cond_%s_%s.png", cell, gene))
+    ggsave(filename = out_filename, plot = p_weighted, width = width, height = height, dpi = dpi, bg = "white")
+    cat(sprintf("Ábra sikeresen elmentve: %s\n", out_filename))
+  }
+  
+  return(p_weighted)
+}
+
+# Futtatás kizárólag a PSMB3-ra mindkét sejtvonalban
+plot_psmb3_weighted(cell = "mcf7")
+plot_psmb3_weighted(cell = "t47d")
+```
+
