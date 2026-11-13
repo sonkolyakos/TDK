@@ -1,1 +1,913 @@
+---
+title: "integration"
+author: "Sonkoly Akos"
+date: "`r Sys.Date()`"
+output: html_document
+---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(msigdbr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+```
+
+# Parameters
+
+dPSI convention throughout the analysis: **dPSI = second condition − first condition**
+(CTR_vs_TIS = TIS − CTR; TIS_vs_REPOP = REPOP − TIS; CTR_vs_REPOP = REPOP − CTR).
+A positive value means higher inclusion in the second condition.
+
+```{r params}
+SIG_THRESHOLD  <- 0.05
+DPSI_THRESHOLD <- 0.1
+MIN_READ_COUNT <- 30     # rMATS only
+
+EVENT_TYPES <- c("SE", "RI", "MXE", "A5SS", "A3SS")
+COMPARISONS <- c("CTR_vs_TIS", "TIS_vs_REPOP", "CTR_vs_REPOP")
+
+RMATS_BASE_DIR <- "/home/akos/Desktop/lab/TDK/rmats"
+LEAF_BASE_DIR  <- "/home/akos/Desktop/lab/TDK/leafcutter2"
+```
+
+# 1. Loading rMATS
+
+`invert_dpsi = TRUE` assumes that `--b1` is the first named condition in every comparison
+(rMATS: IncLevelDifference = sample1 − sample2, hence the inversion). This cannot be verified
+from the output alone; confirm it from the run command / `b1.txt`.
+
+```{r rmats_load}
+calc_mean_counts <- function(count_str) {
+  if (all(is.na(count_str))) return(NA_real_)
+  sapply(strsplit(as.character(count_str), ","), function(x) {
+    mean(as.numeric(x), na.rm = TRUE)
+  })
+}
+
+load_rmats_master_table <- function(dir_path, invert_dpsi = TRUE) {
+
+  load_one_event_type <- function(ev) {
+    f <- file.path(dir_path, paste0(ev, ".MATS.JC.txt"))
+    if (!file.exists(f)) {
+      warning(sprintf("Missing file: %s - skipped.", f))
+      return(NULL)
+    }
+
+    df <- read.delim(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+    names(df) <- make.unique(names(df))
+
+    coord_cols <- grep("Start_0base$|End$|ES$|EE$", names(df), value = TRUE)
+    pos_vec <- apply(df[, coord_cols, drop = FALSE], 1, paste, collapse = "-")
+
+    dpsi_num <- as.numeric(df$IncLevelDifference)
+    if (invert_dpsi) dpsi_num <- -dpsi_num
+
+    m_ijc1 <- calc_mean_counts(df$IJC_SAMPLE_1)
+    m_sjc1 <- calc_mean_counts(df$SJC_SAMPLE_1)
+    m_ijc2 <- calc_mean_counts(df$IJC_SAMPLE_2)
+    m_sjc2 <- calc_mean_counts(df$SJC_SAMPLE_2)
+
+    res <- data.frame(
+      Event_ID    = paste(ev, df$chr, df$strand, pos_vec, sep = "_"),
+      EventType   = ev,
+      Chr         = as.character(df$chr),
+      Position    = pos_vec,
+      Strand_Info = as.character(df$strand),
+      Gene_ID     = as.character(df$GeneID),
+      Gene_Name   = as.character(df$geneSymbol),
+      p_val       = as.numeric(df$PValue),
+      p_val_adj   = as.numeric(df$FDR),
+      dPSI        = dpsi_num,
+      mean_IJC_1  = m_ijc1,
+      mean_SJC_1  = m_sjc1,
+      mean_IJC_2  = m_ijc2,
+      mean_SJC_2  = m_sjc2,
+      stringsAsFactors = FALSE
+    )
+
+    # Coverage filter (rMATS only)
+    res[(res$mean_IJC_1 + res$mean_SJC_1 >= MIN_READ_COUNT) |
+        (res$mean_IJC_2 + res$mean_SJC_2 >= MIN_READ_COUNT), ]
+  }
+
+  combined <- dplyr::bind_rows(lapply(EVENT_TYPES, load_one_event_type))
+
+  if (nrow(combined) == 0 || !"p_val_adj" %in% names(combined)) {
+    stop(sprintf("No readable rMATS data found in: %s", dir_path))
+  }
+
+  combined %>%
+    dplyr::filter(!is.na(p_val_adj)) %>%
+    dplyr::arrange(p_val_adj, dplyr::desc(abs(dPSI)))
+}
+
+load_all_comparisons <- function(cell_line) {
+  setNames(
+    lapply(COMPARISONS, function(cmp) {
+      load_rmats_master_table(file.path(RMATS_BASE_DIR, cell_line, cmp, "output"))
+    }),
+    COMPARISONS
+  )
+}
+
+rmats_mcf7 <- load_all_comparisons("mcf7")
+rmats_t47d <- load_all_comparisons("t47d")
+
+get_rmats_sig_genes <- function(master_data) {
+  master_data %>%
+    dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
+    dplyr::pull(Gene_Name) %>%
+    unique() %>%
+    stats::na.omit() %>%
+    as.character()
+}
+
+sig_genes_mcf7_rmats <- lapply(rmats_mcf7, get_rmats_sig_genes)
+sig_genes_t47d_rmats <- lapply(rmats_t47d, get_rmats_sig_genes)
+```
+
+# 2. Loading LeafCutter
+
+The MCF7 annotated effect-size table is used. For T47D, gene annotation is transferred from
+MCF7 by coordinate (`chr:start:end`, without the `clu_` tag).
+The TIS_vs_REPOP contrast is built in a single place: `deltapsi_REPOP - deltapsi_TIS`.
+
+```{r leaf_load}
+add_leaf_contrasts <- function(df) {
+  stopifnot(all(c("deltapsi_TIS", "deltapsi_REPOP") %in% names(df)))
+  df %>% dplyr::mutate(deltapsi_TIS_vs_REPOP = deltapsi_REPOP - deltapsi_TIS)
+}
+
+cluster_id <- function(intron) {
+  stringr::str_replace(intron, "^([^:]+):[0-9]+:[0-9]+:(clu_.+)$", "\\1:\\2")
+}
+
+coord_id <- function(intron) {
+  stringr::str_extract(intron, "^chr[^:]+:[0-9]+:[0-9]+")
+}
+
+load_leafcutter_mcf7 <- function() {
+  ann_eff <- read.delim(file.path(LEAF_BASE_DIR, "mcf7_annotated_effect_sizes.txt"),
+                        header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  sig_df  <- read.delim(file.path(LEAF_BASE_DIR, "mcf7_ds_results_cluster_significance.txt"),
+                        header = TRUE, sep = "\t", stringsAsFactors = FALSE, quote = "", fill = TRUE)
+
+  ann_eff %>%
+    dplyr::mutate(cluster = cluster_id(intron)) %>%
+    dplyr::left_join(sig_df, by = "cluster") %>%
+    add_leaf_contrasts()
+}
+
+load_leafcutter_t47d <- function(mcf7_annotated_df) {
+  t47d_eff <- read.table(file.path(LEAF_BASE_DIR, "t47d_ds_results_effect_sizes.txt"),
+                         header = TRUE, stringsAsFactors = FALSE)
+  if (!"intron" %in% colnames(t47d_eff)) t47d_eff$intron <- rownames(t47d_eff)
+
+  t47d_sig <- read.delim(file.path(LEAF_BASE_DIR, "t47d_ds_results_cluster_significance.txt"),
+                         header = TRUE, sep = "\t", stringsAsFactors = FALSE, quote = "", fill = TRUE)
+
+  # coordinate -> gene dictionary (one row per coordinate, multiple genes comma-separated)
+  coord_gene_map <- mcf7_annotated_df %>%
+    dplyr::filter(!is.na(gene_name), gene_name != "") %>%
+    dplyr::mutate(coord_key = coord_id(intron)) %>%
+    dplyr::group_by(coord_key) %>%
+    dplyr::summarise(gene_name = paste(unique(gene_name), collapse = ","), .groups = "drop")
+
+  t47d_eff %>%
+    dplyr::mutate(coord_key = coord_id(intron), cluster = cluster_id(intron)) %>%
+    dplyr::left_join(coord_gene_map, by = "coord_key") %>%
+    dplyr::left_join(t47d_sig, by = "cluster") %>%
+    add_leaf_contrasts()
+}
+
+leaf_mcf7 <- load_leafcutter_mcf7()
+leaf_t47d <- load_leafcutter_t47d(leaf_mcf7)
+
+cat("T47D introns with gene annotation:\n")
+print(table(has_gene = !is.na(leaf_t47d$gene_name)))
+
+get_leaf_sig_genes <- function(merged_data, dpsi_col) {
+  raw_genes <- merged_data %>%
+    dplyr::filter(p.adjust < SIG_THRESHOLD, abs(.data[[dpsi_col]]) > DPSI_THRESHOLD) %>%
+    dplyr::pull(gene_name)
+
+  all_genes <- unlist(strsplit(as.character(stats::na.omit(raw_genes)), ","))
+  all_genes <- stringr::str_trim(all_genes)
+  unique(all_genes[all_genes != "" & all_genes != "NA"])
+}
+
+leaf_sig_list <- function(df) list(
+  CTR_vs_TIS   = get_leaf_sig_genes(df, "deltapsi_TIS"),
+  CTR_vs_REPOP = get_leaf_sig_genes(df, "deltapsi_REPOP"),
+  TIS_vs_REPOP = get_leaf_sig_genes(df, "deltapsi_TIS_vs_REPOP")
+)
+
+sig_genes_mcf7_leafcutter <- leaf_sig_list(leaf_mcf7)
+sig_genes_t47d_leafcutter <- leaf_sig_list(leaf_t47d)
+```
+
+# 3. Sanity checks (dPSI sign convention) and helper objects
+
+Defines `cells`, `read_raw_rmats` and `leaf_col`, which are needed for the concordance analysis below.
+
+```{r sanity_checks}
+cells <- list(mcf7 = list(rm = rmats_mcf7, lf = leaf_mcf7),
+              t47d = list(rm = rmats_t47d, lf = leaf_t47d))
+
+# 1. rMATS: is the loaded dPSI identical to the one recomputed from the raw file? (expected: ~1)
+mean_inc <- function(x) vapply(strsplit(as.character(x), ","), function(v)
+  mean(suppressWarnings(as.numeric(v)), na.rm = TRUE), numeric(1))
+
+read_raw_rmats <- function(cell, cmp, ev) {
+  f <- file.path(RMATS_BASE_DIR, cell, cmp, "output", paste0(ev, ".MATS.JC.txt"))
+  if (!file.exists(f)) return(NULL)
+  df <- read.delim(f, stringsAsFactors = FALSE, check.names = FALSE)
+  names(df) <- make.unique(names(df))
+  cc  <- grep("Start_0base$|End$|ES$|EE$", names(df), value = TRUE)
+  pos <- apply(df[, cc, drop = FALSE], 1, paste, collapse = "-")
+  out <- data.frame(Event_ID = paste(ev, df$chr, df$strand, pos, sep = "_"),
+                    chr = as.character(df$chr),
+                    raw_diff = as.numeric(df$IncLevelDifference),
+                    m1 = mean_inc(df$IncLevel1), m2 = mean_inc(df$IncLevel2),
+                    stringsAsFactors = FALSE)
+  if (ev == "SE") { out$uEE <- df$upstreamEE; out$dES <- df$downstreamES }
+  out
+}
+
+rm_check <- dplyr::bind_rows(lapply(names(cells), function(cell) {
+  dplyr::bind_rows(lapply(COMPARISONS, function(cmp) {
+    raw <- dplyr::bind_rows(lapply(EVENT_TYPES, function(ev) read_raw_rmats(cell, cmp, ev)))
+    j <- dplyr::inner_join(cells[[cell]]$rm[[cmp]][, c("Event_ID", "dPSI")], raw, by = "Event_ID") %>%
+      dplyr::filter(is.finite(m1), is.finite(m2))
+    data.frame(cell = cell, cmp = cmp, n = nrow(j),
+               loaded_vs_minus_rawdiff = cor(j$dPSI, -j$raw_diff),
+               loaded_vs_m2_minus_m1   = cor(j$dPSI, j$m2 - j$m1),
+               rawdiff_vs_m1_minus_m2  = cor(j$raw_diff, j$m1 - j$m2))
+  }))
+}))
+cat("\n== 1. rMATS internal check (expected: ~1) ==\n")
+print(rm_check, digits = 3)
+
+# 2. LeafCutter: deltapsi = psi_X - psi_Control (if the psi_* columns exist)
+cat("\n== 2. LeafCutter internal check (expected: ~1) ==\n")
+for (cell in names(cells)) {
+  d <- cells[[cell]]$lf
+  for (g in c("TIS", "REPOP")) {
+    cols <- c(paste0("psi_", g), "psi_Control", paste0("deltapsi_", g))
+    if (all(cols %in% names(d))) {
+      ok <- stats::complete.cases(d[, cols])
+      cat(cell, g, ": cor(deltapsi, psi_", g, " - psi_Control) = ",
+          round(cor(d[[cols[3]]][ok], (d[[cols[1]]] - d[[cols[2]]])[ok]), 3), "\n", sep = "")
+    } else cat(cell, g, ": psi_* columns missing, skipped\n")
+  }
+}
+
+# 3. Additivity: dPSI(CTR->TIS) + dPSI(TIS->REPOP) ~ dPSI(CTR->REPOP)
+cat("\n== 3. Additivity cor(A+B, C) (expected: strongly positive) ==\n")
+for (cell in names(cells)) {
+  rm <- cells[[cell]]$rm
+  j <- dplyr::inner_join(
+    dplyr::inner_join(rm$CTR_vs_TIS[, c("Event_ID", "dPSI")], rm$TIS_vs_REPOP[, c("Event_ID", "dPSI")], by = "Event_ID"),
+    rm$CTR_vs_REPOP[, c("Event_ID", "dPSI")], by = "Event_ID")
+  cat(cell, "rMATS:", round(cor(j$dPSI.x + j$dPSI.y, j$dPSI), 3), sprintf("(n=%d)\n", nrow(j)))
+  d <- cells[[cell]]$lf
+  cat(cell, "Leaf: ", round(cor(d$deltapsi_TIS + d$deltapsi_TIS_vs_REPOP, d$deltapsi_REPOP, use = "complete.obs"), 3), "\n")
+}
+
+leaf_col <- c(CTR_vs_TIS = "deltapsi_TIS", TIS_vs_REPOP = "deltapsi_TIS_vs_REPOP", CTR_vs_REPOP = "deltapsi_REPOP")
+```
+
+# 4. Consensus genes: rMATS ∩ LeafCutter
+
+Per comparison, the intersection of the significant genes of the two tools; the consensus set is the union of these.
+
+```{r consensus}
+consensus_by_cmp <- function(rm, lf) {
+  setNames(lapply(COMPARISONS, function(cmp) intersect(rm[[cmp]], lf[[cmp]])), COMPARISONS)
+}
+
+cons_mcf7 <- consensus_by_cmp(sig_genes_mcf7_rmats, sig_genes_mcf7_leafcutter)
+cons_t47d <- consensus_by_cmp(sig_genes_t47d_rmats, sig_genes_t47d_leafcutter)
+
+consensus_genes <- function(x) sort(unique(unlist(x)))
+core_mcf7 <- consensus_genes(cons_mcf7)
+core_t47d <- consensus_genes(cons_t47d)
+core_pan  <- intersect(core_mcf7, core_t47d)
+
+cat("Consensus genes per comparison (MCF7):\n"); print(sapply(cons_mcf7, length))
+cat("Consensus genes per comparison (T47D):\n"); print(sapply(cons_t47d, length))
+cat("MCF7 consensus (union):", length(core_mcf7), "\n")
+cat("T47D consensus (union):", length(core_t47d), "\n")
+cat("In both cell lines:    ", length(core_pan),  "\n")
+```
+
+# 5. Trajectory logic (per consensus gene)
+
+A = CTR→TIS, B = TIS→REPOP, C = CTR→REPOP. Significant: FDR < `SIG_THRESHOLD` and |dPSI| > `DPSI_THRESHOLD`.
+
+```{r traj_functions}
+TRAJ_LEVELS <- c("Transient", "Persistent", "Progressive", "Reversed",
+                 "REPOP_specific", "Other", "Not_testable")
+
+classify_trajectory <- function(dA, dB, dC, sA, sB, sC) {
+  dplyr::case_when(
+    is.na(dA) | is.na(dB) | is.na(dC)                          ~ "Not_testable",
+    sA & sB & sC & sign(dB) == sign(dA) & sign(dC) == sign(dA) ~ "Progressive",
+    sA & !sC & sign(dB) == -sign(dA)                           ~ "Transient",
+    sA & sC & sign(dC) == sign(dA)                             ~ "Persistent",
+    sA & sC & sign(dC) != sign(dA)                             ~ "Reversed",
+    !sA & sC                                                   ~ "REPOP_specific",
+    TRUE                                                       ~ "Other"
+  )
+}
+
+is_sig <- function(fdr, dpsi) {
+  !is.na(fdr) & !is.na(dpsi) & fdr < SIG_THRESHOLD & abs(dpsi) > DPSI_THRESHOLD
+}
+
+# rMATS: event level
+rmats_event_traj <- function(rm_list, genes) {
+  pick <- function(cmp, sfx) {
+    rm_list[[cmp]] %>%
+      dplyr::filter(Gene_Name %in% genes) %>%
+      dplyr::distinct(Event_ID, .keep_all = TRUE) %>%
+      dplyr::select(Event_ID, EventType, Gene_Name, dPSI, p_val_adj) %>%
+      dplyr::rename_with(~ paste0(.x, "_", sfx), c(dPSI, p_val_adj))
+  }
+  keys <- c("Event_ID", "EventType", "Gene_Name")
+  pick("CTR_vs_TIS", "A") %>%
+    dplyr::full_join(pick("TIS_vs_REPOP", "B"), by = keys) %>%
+    dplyr::full_join(pick("CTR_vs_REPOP", "C"), by = keys) %>%
+    dplyr::mutate(
+      sA = is_sig(p_val_adj_A, dPSI_A),
+      sB = is_sig(p_val_adj_B, dPSI_B),
+      sC = is_sig(p_val_adj_C, dPSI_C),
+      Class = classify_trajectory(dPSI_A, dPSI_B, dPSI_C, sA, sB, sC)
+    )
+}
+
+# LeafCutter: intron level (p.adjust is cluster-level, shared by all three comparisons)
+leaf_intron_traj <- function(leaf_df, genes) {
+  leaf_df %>%
+    dplyr::filter(!is.na(gene_name), !is.na(p.adjust)) %>%
+    tidyr::separate_rows(gene_name, sep = ",") %>%
+    dplyr::mutate(gene_name = stringr::str_trim(gene_name)) %>%
+    dplyr::filter(gene_name %in% genes) %>%
+    dplyr::transmute(
+      Gene_Name = gene_name, intron, cluster, FDR = p.adjust,
+      dPSI_A = deltapsi_TIS, dPSI_B = deltapsi_TIS_vs_REPOP, dPSI_C = deltapsi_REPOP
+    ) %>%
+    dplyr::mutate(
+      sA = is_sig(FDR, dPSI_A), sB = is_sig(FDR, dPSI_B), sC = is_sig(FDR, dPSI_C),
+      Class = classify_trajectory(dPSI_A, dPSI_B, dPSI_C, sA, sB, sC)
+    )
+}
+
+# Gene level: strongest rMATS event and strongest LeafCutter intron per gene
+gene_trajectory <- function(cell_line, rm_list, leaf_df, genes) {
+  r_ev <- rmats_event_traj(rm_list, genes)
+  l_ev <- leaf_intron_traj(leaf_df, genes)
+
+  r_top <- r_ev %>%
+    dplyr::filter(Class != "Not_testable") %>%
+    dplyr::mutate(minFDR = pmin(p_val_adj_A, p_val_adj_B, p_val_adj_C, na.rm = TRUE),
+                  maxD   = pmax(abs(dPSI_A), abs(dPSI_B), abs(dPSI_C), na.rm = TRUE)) %>%
+    dplyr::arrange(minFDR, dplyr::desc(maxD)) %>%
+    dplyr::group_by(Gene_Name) %>% dplyr::slice(1) %>% dplyr::ungroup() %>%
+    dplyr::select(Gene_Name, rMATS_Event = EventType, rMATS_Class = Class,
+                  rMATS_dPSI_A = dPSI_A, rMATS_dPSI_B = dPSI_B, rMATS_dPSI_C = dPSI_C)
+
+  l_top <- l_ev %>%
+    dplyr::filter(Class != "Not_testable") %>%
+    dplyr::mutate(maxD = pmax(abs(dPSI_A), abs(dPSI_B), abs(dPSI_C), na.rm = TRUE)) %>%
+    dplyr::arrange(FDR, dplyr::desc(maxD)) %>%
+    dplyr::group_by(Gene_Name) %>% dplyr::slice(1) %>% dplyr::ungroup() %>%
+    dplyr::select(Gene_Name, Leaf_Cluster = cluster, Leaf_Class = Class,
+                  Leaf_dPSI_A = dPSI_A, Leaf_dPSI_B = dPSI_B, Leaf_dPSI_C = dPSI_C)
+
+  data.frame(Gene_Name = genes, stringsAsFactors = FALSE) %>%
+    dplyr::left_join(r_top, by = "Gene_Name") %>%
+    dplyr::left_join(l_top, by = "Gene_Name") %>%
+    dplyr::mutate(
+      Cell_Line   = cell_line,
+      rMATS_Class = factor(dplyr::coalesce(rMATS_Class, "Not_testable"), levels = TRAJ_LEVELS),
+      Leaf_Class  = factor(dplyr::coalesce(Leaf_Class,  "Not_testable"), levels = TRAJ_LEVELS),
+      Class_Match = ifelse(rMATS_Class == Leaf_Class, "Match", "Mismatch")
+    )
+}
+```
+
+```{r traj_run}
+traj_mcf7 <- gene_trajectory("MCF7", rmats_mcf7, leaf_mcf7, core_mcf7)
+traj_t47d <- gene_trajectory("T47D", rmats_t47d, leaf_t47d, core_t47d)
+traj_all  <- dplyr::bind_rows(traj_mcf7, traj_t47d)
+```
+
+# 6. Over-representation analysis (ORA)
+
+Input: consensus genes only. The statistical background (universe) is the set of genes testable
+in both tools in the given cell line.
+
+```{r ora}
+hallmark_t2g <- msigdbr::msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+tested_universe <- function(rm_list, leaf_df) {
+  rm_g <- unique(stats::na.omit(unlist(lapply(rm_list, function(d) d$Gene_Name))))
+  lf_g <- leaf_df %>%
+    dplyr::filter(!is.na(gene_name), !is.na(p.adjust)) %>%
+    dplyr::pull(gene_name) %>%
+    strsplit(",") %>% unlist() %>% stringr::str_trim() %>% unique()
+  intersect(rm_g, lf_g)
+}
+
+run_ora <- function(genes, universe, label, hallmark_set = hallmark_t2g) {
+  genes <- intersect(genes, universe)
+  cat(sprintf("\n[%s] ORA input: %d genes, universe: %d genes\n", label, length(genes), length(universe)))
+  out <- list()
+
+  # --- GO:BP ---
+  go <- tryCatch(
+    clusterProfiler::enrichGO(gene = genes, universe = universe, OrgDb = org.Hs.eg.db,
+                              keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH",
+                              pvalueCutoff = 0.05, qvalueCutoff = 0.05,
+                              minGSSize = 10, maxGSSize = 500),
+    error = function(e) NULL)
+  if (!is.null(go) && nrow(as.data.frame(go)) > 1) {
+    go <- tryCatch(clusterProfiler::simplify(go, cutoff = 0.7, by = "p.adjust", select_fun = min),
+                   error = function(e) go)
+  }
+  out$GO <- go
+
+  # --- Reactome ---
+  map_ids <- function(x) {
+    res <- tryCatch(
+      clusterProfiler::bitr(x, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db),
+      error = function(e) NULL)
+    if (is.null(res)) character(0) else res$ENTREZID
+  }
+  entrez_genes <- map_ids(genes)
+  entrez_univ  <- map_ids(universe)
+
+  out$Reactome <- tryCatch(
+    ReactomePA::enrichPathway(gene = entrez_genes, universe = entrez_univ,
+                              organism = "human", pAdjustMethod = "BH",
+                              pvalueCutoff = 0.05, qvalueCutoff = 0.05,
+                              minGSSize = 10, maxGSSize = 500, readable = TRUE),
+    error = function(e) NULL)
+
+  # --- MSigDB Hallmark (TERM2GENE-based over-representation test with symbols) ---
+  out$Hallmark <- tryCatch(
+    clusterProfiler::enricher(gene = genes, universe = universe,
+                              TERM2GENE = hallmark_set,
+                              pAdjustMethod = "BH",
+                              pvalueCutoff = 0.05, qvalueCutoff = 0.05,
+                              minGSSize = 10, maxGSSize = 500),
+    error = function(e) NULL)
+
+  # --- Save and plot ---
+  for (nm in names(out)) {
+    res <- if (is.null(out[[nm]])) data.frame() else as.data.frame(out[[nm]])
+    cat(sprintf("  %s: %d significant terms\n", nm, nrow(res)))
+    if (nrow(res) > 0) {
+      write.csv(res, sprintf("ORA_%s_%s.csv", label, nm), row.names = FALSE)
+      p <- enrichplot::dotplot(out[[nm]], showCategory = 15) +
+        ggplot2::ggtitle(sprintf("%s - %s ORA", label, nm))
+      print(p)
+    }
+  }
+  invisible(out)
+}
+
+univ_mcf7 <- tested_universe(rmats_mcf7, leaf_mcf7)
+univ_t47d <- tested_universe(rmats_t47d, leaf_t47d)
+univ_pan  <- intersect(univ_mcf7, univ_t47d)
+
+ora_mcf7 <- run_ora(core_mcf7, univ_mcf7, "MCF7")
+ora_t47d <- run_ora(core_t47d, univ_t47d, "T47D")
+ora_pan  <- run_ora(core_pan,  univ_pan,  "MCF7_T47D_shared")
+```
+
+# 7. Figure 8: trajectory heatmaps (CTR→TIS and TIS→REPOP)
+
+```{r fig8-heatmap}
+save_plot <- function(filename, width, height, plot_fn, res = 300) {
+  png(filename, width = width, height = height, units = "in", res = res)
+  plot_fn()
+  dev.off()
+}
+
+LIM <- 0.4
+col_fun <- circlize::colorRamp2(c(-LIM, 0, LIM), c("#2166AC", "white", "#B2182B"))
+ev_cols <- c(SE = "#4E79A7", RI = "#F28E2B", MXE = "#59A14F", A5SS = "#B07AA1", A3SS = "#E15759")
+class_levels <- c("Persistent", "Progressive", "Partial", "Transient", "Reversed", "REPOP_specific")
+
+retention_class <- function(a, c, thr = DPSI_THRESHOLD) {
+  r <- c / a
+  dplyr::case_when(
+    is.na(a) | is.na(c)            ~ NA_character_,
+    abs(a) < thr & abs(c) >= thr   ~ "REPOP_specific",
+    abs(a) < thr                   ~ NA_character_,
+    r < -0.33                      ~ "Reversed",
+    r <  0.33                      ~ "Transient",
+    r <  0.67                      ~ "Partial",
+    r <= 1.33                      ~ "Persistent",
+    TRUE                           ~ "Progressive"
+  )
+}
+
+prep_traj <- function(traj) {
+  traj %>%
+    dplyr::filter(!is.na(rMATS_dPSI_A), !is.na(rMATS_dPSI_C)) %>%
+    dplyr::mutate(a = rMATS_dPSI_A, c = rMATS_dPSI_C,
+                  cls = factor(retention_class(a, c), levels = class_levels),
+                  lead = ifelse(cls == "REPOP_specific", c, a)) %>%      # block direction
+    dplyr::filter(!is.na(cls)) %>%
+    dplyr::arrange(cls, dplyr::desc(lead))                               # within block: + top, - bottom
+}
+
+# Top 2 most pronounced genes per block
+top_idx <- function(d, k = 2) {
+  d %>% dplyr::mutate(i = dplyr::row_number()) %>%
+    dplyr::group_by(cls) %>%
+    dplyr::slice_max(abs(a) + abs(c), n = k, with_ties = FALSE) %>%
+    dplyr::pull(i)
+}
+
+common_args_trans <- list(
+  name = "dPSI", col = col_fun,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  row_gap = grid::unit(2.5, "mm"),
+  row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 11, fontface = "bold"),
+  show_row_names = FALSE,
+  column_names_rot = 0, column_names_centered = TRUE, column_names_side = "top",
+  column_title_gp = grid::gpar(fontface = "bold", fontsize = 14),
+  border = TRUE, rect_gp = grid::gpar(col = NA), use_raster = FALSE,
+  heatmap_legend_param = list(title = "dPSI\n(Transition)", at = c(-LIM, -LIM / 2, 0, LIM / 2, LIM))
+)
+
+traj_heatmap_transitions <- function(traj, cell_label) {
+  d <- prep_traj(traj)
+  # Column 1: CTR->TIS (= TIS vs CTR dPSI); column 2: TIS->REPOP (= REPOP-vs-CTR minus TIS-vs-CTR)
+  mat <- cbind("CTR->TIS" = d$a, "TIS->REPOP" = d$c - d$a)
+  rownames(mat) <- d$Gene_Name
+
+  idx <- top_idx(d)
+  do.call(ComplexHeatmap::Heatmap, c(list(
+    mat, row_split = d$cls, column_title = cell_label, width = grid::unit(6, "cm"),
+    right_annotation = ComplexHeatmap::rowAnnotation(
+      Event = d$rMATS_Event, col = list(Event = ev_cols),
+      Gene = ComplexHeatmap::anno_mark(at = idx, labels = d$Gene_Name[idx],
+                                       labels_gp = grid::gpar(fontsize = 9)),
+      annotation_name_gp = grid::gpar(fontsize = 9))
+  ), common_args_trans))
+}
+
+ht_mcf7_trans <- traj_heatmap_transitions(traj_mcf7, "MCF7")
+ht_t47d_trans <- traj_heatmap_transitions(traj_t47d, "T47D")
+
+# Both heatmaps side by side with one shared legend
+draw_combined <- function() {
+  pd <- ComplexHeatmap::packLegend(
+    ComplexHeatmap::Legend(title = "dPSI\n(Transition)", col_fun = col_fun,
+                           at = c(-LIM, -LIM / 2, 0, LIM / 2, LIM)),
+    ComplexHeatmap::Legend(title = "Event", at = names(ev_cols),
+                           legend_gp = grid::gpar(fill = ev_cols)),
+    direction = "vertical"
+  )
+
+  grid::grid.newpage()
+  grid::pushViewport(grid::viewport(layout = grid::grid.layout(nrow = 1, ncol = 2)))
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1))
+  ComplexHeatmap::draw(ht_mcf7_trans, show_heatmap_legend = FALSE,
+                       show_annotation_legend = FALSE, newpage = FALSE)
+  grid::popViewport()
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 2))
+  ComplexHeatmap::draw(ht_t47d_trans, show_heatmap_legend = FALSE,
+                       show_annotation_legend = FALSE, newpage = FALSE)
+  ComplexHeatmap::draw(pd, x = grid::unit(0.95, "npc"), y = grid::unit(0.5, "npc"),
+                       just = c("right", "center"))
+  grid::popViewport()
+}
+
+save_plot("heatmap_transitions_Combined.png", width = 10.5, height = 10, plot_fn = draw_combined)
+```
+
+# 8. Figure 9: UpSet plots (rMATS vs LeafCutter, three comparisons)
+
+```{r fig9-upset}
+cmp_short <- c(CTR_vs_TIS = "CTR vs TIS", TIS_vs_REPOP = "TIS vs REPOP", CTR_vs_REPOP = "CTR vs REPOP")
+col_tool  <- c(rMATS = "#4E79A7", LeafCutter = "#F28E2B", Both = "#C0392B")
+
+upset_integrated <- function(rm, lf, title, top_n = 20) {
+  sets <- c(setNames(rm[COMPARISONS], paste("rMATS", cmp_short[COMPARISONS])),
+            setNames(lf[COMPARISONS], paste("LC",    cmp_short[COMPARISONS])))
+  is_rm <- grepl("^rMATS", names(sets))
+
+  m <- ComplexHeatmap::make_comb_mat(sets, mode = "distinct")
+  m <- m[ComplexHeatmap::comb_size(m) > 0]
+  m <- m[order(ComplexHeatmap::comb_size(m), decreasing = TRUE)]
+  m <- m[seq_len(min(top_n, ncol(m)))]
+
+  bits <- sapply(ComplexHeatmap::comb_name(m), function(s) as.integer(strsplit(s, "")[[1]]))
+  bits <- matrix(bits, nrow = length(sets))
+  has_rm <- colSums(bits[is_rm,  , drop = FALSE]) > 0
+  has_lf <- colSums(bits[!is_rm, , drop = FALSE]) > 0
+  tool <- ifelse(has_rm & has_lf, "Both", ifelse(has_rm, "rMATS", "LeafCutter"))
+  cc <- unname(col_tool[tool])
+
+  ComplexHeatmap::UpSet(
+    m, comb_order = seq_len(ncol(m)), set_order = names(sets),
+    width  = unit(top_n * 3.5, "mm"),
+    height = unit(35, "mm"),
+    pt_size = unit(2.4, "mm"), lwd = 1.5, comb_col = cc,
+    row_names_gp = gpar(fontsize = 9, fontfamily = "Arial"),
+    top_annotation = ComplexHeatmap::upset_top_annotation(
+      m, add_numbers = TRUE, numbers_gp = gpar(fontsize = 7, fontfamily = "Arial"),
+      gp = gpar(fill = cc, col = NA), height = unit(30, "mm"),
+      annotation_name_gp = gpar(fontsize = 9, fontfamily = "Arial"),
+      axis_param = list(side = "left", gp = gpar(fontsize = 8, fontfamily = "Arial"))),
+    right_annotation = ComplexHeatmap::upset_right_annotation(
+      m, add_numbers = TRUE, numbers_gp = gpar(fontsize = 7, fontfamily = "Arial"),
+      width = unit(18, "mm"),
+      gp = gpar(fill = ifelse(is_rm, col_tool[["rMATS"]], col_tool[["LeafCutter"]]), col = NA),
+      annotation_name_gp = gpar(fontsize = 9, fontfamily = "Arial"),
+      axis_param = list(gp = gpar(fontsize = 8, fontfamily = "Arial"))),
+    column_title = title,
+    column_title_gp = gpar(fontface = "bold", fontsize = 13, fontfamily = "Arial")
+  )
+}
+
+lgd <- ComplexHeatmap::Legend(title = "Tool", at = names(col_tool), legend_gp = gpar(fill = col_tool),
+              labels_gp = gpar(fontsize = 9, fontfamily = "Arial"),
+              title_gp  = gpar(fontsize = 10, fontface = "bold", fontfamily = "Arial"))
+
+draw_vertical <- function() {
+  grid.newpage()
+  pushViewport(viewport(layout = grid.layout(
+    nrow = 2, ncol = 3,
+    widths = unit(c(1, 5, 20), c("null", "mm", "mm"))
+  )))
+
+  # Panel A: MCF7
+  pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 1))
+  ComplexHeatmap::draw(upset_integrated(sig_genes_mcf7_rmats, sig_genes_mcf7_leafcutter, "MCF7"), newpage = FALSE)
+  grid.text("A", x = unit(2, "mm"), y = unit(1, "npc") - unit(2, "mm"),
+            just = c("left", "top"), gp = gpar(fontsize = 16, fontface = "bold", fontfamily = "Arial"))
+  popViewport()
+
+  # Panel B: T47D
+  pushViewport(viewport(layout.pos.row = 2, layout.pos.col = 1))
+  ComplexHeatmap::draw(upset_integrated(sig_genes_t47d_rmats, sig_genes_t47d_leafcutter, "T47D"), newpage = FALSE)
+  grid.text("B", x = unit(2, "mm"), y = unit(1, "npc") - unit(2, "mm"),
+            just = c("left", "top"), gp = gpar(fontsize = 16, fontface = "bold", fontfamily = "Arial"))
+  popViewport()
+
+  # Legend in the third column
+  pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 3))
+  ComplexHeatmap::draw(lgd, x = unit(0, "mm"), y = unit(0.7, "npc"), just = c("left", "top"))
+  popViewport()
+
+  popViewport()
+}
+
+png("upset_integrated_vertical.png", width = 160, height = 210, units = "mm", res = 300, bg = "white")
+draw_vertical()
+invisible(dev.off())
+```
+
+# 9. Cross-cell-line overlap (corrected Jaccard index)
+
+```{r jaccard-rmats}
+# Events tested in both cell lines (shared testable universe)
+mcf7_tested_events <- unique(unlist(lapply(rmats_mcf7, function(df) df$Event_ID)))
+t47d_tested_events <- unique(unlist(lapply(rmats_t47d, function(df) df$Event_ID)))
+shared_testable_events <- intersect(mcf7_tested_events, t47d_tested_events)
+
+get_sig_events <- function(rm_list) {
+  unique(unlist(lapply(rm_list, function(df) {
+    df %>%
+      dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
+      dplyr::pull(Event_ID)
+  })))
+}
+
+mcf7_sig_filtered <- intersect(get_sig_events(rmats_mcf7), shared_testable_events)
+t47d_sig_filtered <- intersect(get_sig_events(rmats_t47d), shared_testable_events)
+
+overlap_count     <- length(intersect(mcf7_sig_filtered, t47d_sig_filtered))
+union_count       <- length(union(mcf7_sig_filtered, t47d_sig_filtered))
+corrected_jaccard <- overlap_count / union_count * 100
+
+cat("--- rMATS cross-cell-line overlap (shared universe) ---\n")
+cat("Shared testable events:", length(shared_testable_events), "\n")
+cat("MCF7 significant (restricted):", length(mcf7_sig_filtered), "\n")
+cat("T47D significant (restricted):", length(t47d_sig_filtered), "\n")
+cat("Overlap:", overlap_count, "\n")
+cat("Corrected Jaccard index:", round(corrected_jaccard, 2), "%\n")
+```
+
+```{r jaccard-leafcutter}
+get_leaf_tested_genes <- function(leaf_df) {
+  leaf_df %>%
+    dplyr::filter(!is.na(p.adjust), !is.na(gene_name)) %>%
+    dplyr::pull(gene_name) %>%
+    strsplit(",") %>% unlist() %>% stringr::str_trim() %>% unique()
+}
+
+shared_leaf_universe <- intersect(get_leaf_tested_genes(leaf_mcf7), get_leaf_tested_genes(leaf_t47d))
+
+mcf7_leaf_filtered <- intersect(unique(unlist(sig_genes_mcf7_leafcutter)), shared_leaf_universe)
+t47d_leaf_filtered <- intersect(unique(unlist(sig_genes_t47d_leafcutter)), shared_leaf_universe)
+
+leaf_overlap <- length(intersect(mcf7_leaf_filtered, t47d_leaf_filtered))
+leaf_union   <- length(union(mcf7_leaf_filtered, t47d_leaf_filtered))
+leaf_jaccard <- leaf_overlap / leaf_union * 100
+
+cat("--- LeafCutter cross-cell-line overlap (shared universe) ---\n")
+cat("Shared testable genes:", length(shared_leaf_universe), "\n")
+cat("MCF7 significant (restricted):", length(mcf7_leaf_filtered), "\n")
+cat("T47D significant (restricted):", length(t47d_leaf_filtered), "\n")
+cat("Overlap:", leaf_overlap, "\n")
+cat("Corrected LeafCutter Jaccard index:", round(leaf_jaccard, 2), "%\n")
+```
+
+# 10. Figure 10: rMATS vs LeafCutter directional concordance (unfiltered LeafCutter)
+
+SE events significant in rMATS (ground truth) are matched by exact junction coordinates to
+LeafCutter introns, with no significance or effect-size filter on the LeafCutter side.
+The LeafCutter dPSI of the skipping intron is multiplied by −1 to make it comparable to inclusion.
+
+```{r fig10-concordance}
+TOL <- 2  # bp tolerance for 0/1-based coordinates
+
+se_map_unfiltered <- dplyr::bind_rows(lapply(names(cells), function(cell) {
+
+  # LeafCutter: NO filtering (no p.adjust or dPSI cutoff)
+  lf_unfiltered <- cells[[cell]]$lf %>%
+    dplyr::mutate(chr = sub(":.*", "", intron),
+                  s = as.numeric(sub("^[^:]+:([0-9]+):.*", "\\1", intron)),
+                  e = as.numeric(sub("^[^:]+:[0-9]+:([0-9]+):.*", "\\1", intron)))
+
+  dplyr::bind_rows(lapply(COMPARISONS, function(cmp) {
+    raw <- read_raw_rmats(cell, cmp, "SE")
+
+    # rMATS: ground-truth set (significance filter kept here)
+    se <- dplyr::inner_join(cells[[cell]]$rm[[cmp]][, c("Event_ID", "EventType", "dPSI", "p_val_adj")],
+                            raw[, c("Event_ID", "chr", "uEE", "dES")], by = "Event_ID") %>%
+      dplyr::filter(EventType == "SE", p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD)
+
+    col <- leaf_col[[cmp]]
+
+    suppressWarnings(dplyr::inner_join(se, lf_unfiltered[, c("chr", "s", "e", col)], by = "chr")) %>%
+      dplyr::filter(abs(s - (uEE + 1)) <= TOL, abs(e - dES) <= TOL) %>%
+      dplyr::filter(!is.na(.data[[col]])) %>%
+      dplyr::mutate(cell = cell, cmp = cmp, rMATS_dPSI = dPSI, Leaf_dPSI_incl = -.data[[col]])
+  }))
+}))
+
+# Event-level aggregation (several introns can match one event)
+se_merged_unfiltered <- se_map_unfiltered %>%
+  dplyr::group_by(cell, cmp, Event_ID) %>%
+  dplyr::summarise(
+    rMATS_dPSI = dplyr::first(rMATS_dPSI),
+    Leaf_dPSI_incl = mean(Leaf_dPSI_incl, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Concordant = ifelse(sign(rMATS_dPSI) == sign(Leaf_dPSI_incl), "Same direction", "Opposite direction"),
+    Concordant = factor(Concordant, levels = c("Same direction", "Opposite direction"))
+  )
+
+conc_stats_unfiltered_total <- se_merged_unfiltered %>%
+  dplyr::summarise(
+    n         = dplyr::n(),
+    n_conc    = sum(Concordant == "Same direction"),
+    pct_conc  = floor(100 * n_conc / n),   # floor: conservative label (no rounding up)
+    r_pearson = if (n >= 3) cor(rMATS_dPSI, Leaf_dPSI_incl, method = "pearson")  else NA_real_,
+    r_spear   = if (n >= 3) cor(rMATS_dPSI, Leaf_dPSI_incl, method = "spearman") else NA_real_,
+    p_binom   = if (n >= 1) binom.test(n_conc, n, p = 0.5)$p.value else NA_real_
+  ) %>%
+  dplyr::mutate(label = sprintf("n = %d\nPearson r = %.2f\nSpearman \u03c1 = %.2f\nConcordant: %.0f%% (p %s)",
+                                n, r_pearson, r_spear, pct_conc,
+                                ifelse(p_binom < 0.05, "< 0.05", sprintf("= %.3f", p_binom))))
+
+print(conc_stats_unfiltered_total %>% dplyr::select(-label))
+
+col_conc <- c("Same direction" = "#238B45", "Opposite direction" = "#C0392B")
+lim <- ceiling(max(abs(c(se_merged_unfiltered$rMATS_dPSI, se_merged_unfiltered$Leaf_dPSI_incl)), na.rm = TRUE) * 10) / 10
+
+p_conc_unfiltered_total <- ggplot(se_merged_unfiltered, aes(rMATS_dPSI, Leaf_dPSI_incl, colour = Concordant)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = -DPSI_THRESHOLD, ymax = DPSI_THRESHOLD, fill = "grey95") +
+  annotate("rect", ymin = -Inf, ymax = Inf, xmin = -DPSI_THRESHOLD, xmax = DPSI_THRESHOLD, fill = "grey95") +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_point(alpha = 0.6, size = 1.4) +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE, colour = "black", linewidth = 0.6, formula = y ~ x) +
+  geom_text(data = conc_stats_unfiltered_total, aes(x = -lim * 0.95, y = lim * 0.95, label = label),
+            inherit.aes = FALSE, hjust = 0, vjust = 1, size = 3.5, lineheight = 0.95) +
+  scale_colour_manual(values = col_conc, name = NULL) +
+  coord_fixed(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "rMATS dPSI (Filtered Ground Truth)",
+       y = "LeafCutter dPSI (Unfiltered match)",
+       title = "Effect-direction concordance: rMATS vs LeafCutter (Unfiltered)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+print(p_conc_unfiltered_total)
+ggsave("effect_concordance_unfiltered_merged.png", p_conc_unfiltered_total,
+       width = 7.5, height = 7.5, dpi = 300, bg = "white")
+```
+
+# 11. Figure 17: trajectory profiles of shared events (mean |dPSI|)
+
+Requires `ht_pan` and `mat2` (heatmap of the genes shared by both cell lines). These come from a chunk that is **not** in this file.
+
+```{r fig17-profiles}
+ht_drawn   <- ComplexHeatmap::draw(ht_pan, merge_legend = TRUE)
+row_orders <- ComplexHeatmap::row_order(ht_drawn)
+
+cluster_assignments <- data.frame(
+  Gene_Type = rownames(mat2)[unlist(row_orders)],
+  Cluster   = rep(names(row_orders), times = sapply(row_orders, length)),
+  stringsAsFactors = FALSE
+)
+
+df_mat <- as.data.frame(mat2)
+colnames(df_mat) <- c("CTR_vs_TIS_MCF7", "CTR_vs_REPOP_MCF7", "CTR_vs_TIS_T47D", "CTR_vs_REPOP_T47D")
+df_mat$Gene_Type <- rownames(mat2)
+
+df_long <- df_mat %>%
+  dplyr::left_join(cluster_assignments, by = "Gene_Type") %>%
+  tidyr::pivot_longer(
+    cols = -c(Gene_Type, Cluster),
+    names_to = c("Condition", "CellLine"),
+    names_pattern = "(CTR_vs_TIS|CTR_vs_REPOP)_(MCF7|T47D)",
+    values_to = "dPSI"
+  ) %>%
+  dplyr::mutate(
+    Condition = factor(Condition, levels = c("CTR_vs_TIS", "CTR_vs_REPOP"),
+                       labels = c("CTR\u2192TIS", "CTR\u2192REPOP")),
+    CellLine = factor(CellLine, levels = c("MCF7", "T47D"))
+  )
+
+# Mean and standard error of ABSOLUTE dPSI per cluster and condition
+df_summary <- df_long %>%
+  dplyr::group_by(Cluster, Condition, CellLine) %>%
+  dplyr::summarise(
+    mean_abs_dPSI = mean(abs(dPSI), na.rm = TRUE),
+    se = sd(abs(dPSI), na.rm = TRUE) / sqrt(dplyr::n()),
+    .groups = "drop"
+  )
+
+# CTR baseline so that every line starts at 0
+df_baseline <- df_summary %>%
+  dplyr::distinct(Cluster, CellLine) %>%
+  dplyr::mutate(Condition = "CTR", mean_abs_dPSI = 0, se = 0)
+
+df_summary_full <- dplyr::bind_rows(df_baseline, df_summary) %>%
+  dplyr::mutate(Condition = factor(Condition, levels = c("CTR", "CTR\u2192TIS", "CTR\u2192REPOP")))
+
+p_profiles <- ggplot(df_summary_full, aes(x = Condition, y = mean_abs_dPSI, group = CellLine, color = CellLine)) +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_errorbar(aes(ymin = mean_abs_dPSI - se, ymax = mean_abs_dPSI + se), width = 0.15, linewidth = 0.8) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  facet_wrap(~ Cluster, scales = "free_y") +
+  scale_color_manual(values = c("MCF7" = "#2166AC", "T47D" = "#B2182B")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title = "Shared splicing events between cell lines",
+    subtitle = "Trajectory profiles (Mean Absolute |\u0394PSI| avoids cancellation)",
+    x = "Condition",
+    y = expression(paste("Mean Absolute |", Delta, "PSI| vs CTR"))
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "bottom", legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    strip.background = element_rect(fill = "grey90", color = "black"),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(p_profiles)
+ggsave("cross_cell_line_cluster_profiles_absolute.png", p_profiles, width = 11, height = 7, dpi = 300, bg = "white")
+```
