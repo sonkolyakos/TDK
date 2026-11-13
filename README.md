@@ -3,7 +3,7 @@
 
 This repository contains the bioinformatics analysis code, scripts, and documentation for my TDK (Scientific Students' Conference) thesis.
 
-The research was conducted as a student of the Pázmány Péter Catholic University, Faculty of Information Technology and Bionics (PPKE ITK), in collaboration with the Epigenetics and Genome Editing Laboratory at the Institute of Molecular Life Sciences, HUN-REN RCNS.
+The research was conducted as a student of the Pázmány Péter Catholic University, Faculty of Information Technology and Bionics (PPKE ITK), in collaboration with the Epigenetics and Genome Editing Laboratory at the Institute of Molecular Life Sciences, HUN-REN RCNS (https://www.ttk.hun-ren.hu/ei/en/epigenetic-and-genome-editing-research-group/).
 
 This project investigates transcriptome-wide alternative splicing dynamics across therapy-induced senescence (TIS) and subsequent repopulation in breast cancer cells (MCF7 and T47D) using bulk RNA-seq data.
 
