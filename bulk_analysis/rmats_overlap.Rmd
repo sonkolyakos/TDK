@@ -9,38 +9,31 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r}
+```{r libs}
 library(readr)
-library(ggplot2)
-library(ggVennDiagram)
 library(dplyr)
-library(sf)
-library(DT)
-library(scales)
-library(ggrepel)
+library(tidyr)
+library(ggplot2)
 library(patchwork)
 library(eulerr)
-library(patchwork)
-library(tidyr)
+library(scales)
 ```
 
-```{r}
-
+```{r load-rmats}
 SIG_THRESHOLD  <- 0.05
 DPSI_THRESHOLD <- 0.1
 EVENT_TYPES    <- c("SE", "RI", "MXE", "A5SS", "A3SS")
 
 calc_mean_counts <- function(count_str) {
-  if(all(is.na(count_str))) return(NA)
+  if (all(is.na(count_str))) return(NA)
   sapply(strsplit(as.character(count_str), ","), function(x) {
     mean(as.numeric(x), na.rm = TRUE)
   })
 }
-# ---------------------------------------------------------
 
 load_rmats_master_table <- function(dir_path, invert_dpsi = TRUE) {
 
-  load_one_event_type <- function(ev) {   
+  load_one_event_type <- function(ev) {
     f <- file.path(dir_path, paste0(ev, ".MATS.JC.txt"))
     if (!file.exists(f)) {
       warning(sprintf("Missing file: %s - skipped.", f))
@@ -58,19 +51,15 @@ load_rmats_master_table <- function(dir_path, invert_dpsi = TRUE) {
         dPSI      = if (invert_dpsi) -as.numeric(IncLevelDifference) else as.numeric(IncLevelDifference),
         Position  = apply(dplyr::across(dplyr::all_of(coord_cols)), 1, paste, collapse = "-"),
         Event_ID  = paste(EventType, chr, strand, Position, sep = "_"),
-        
-        #  Means calc
         mean_IJC_1 = calc_mean_counts(IJC_SAMPLE_1),
         mean_SJC_1 = calc_mean_counts(SJC_SAMPLE_1),
         mean_IJC_2 = calc_mean_counts(IJC_SAMPLE_2),
         mean_SJC_2 = calc_mean_counts(SJC_SAMPLE_2)
       ) %>%
-      # IJC+SJC mean at least be 30
       dplyr::filter((mean_IJC_1 + mean_SJC_1 >= 30) | (mean_IJC_2 + mean_SJC_2 >= 30)) %>%
-      
       dplyr::rename(Chr = chr, Strand_Info = strand, Gene_ID = GeneID, Gene_Name = geneSymbol) %>%
       dplyr::select(Event_ID, EventType, Chr, Position, Strand_Info, Gene_ID, Gene_Name,
-                     p_val, p_val_adj, dPSI)
+                    p_val, p_val_adj, dPSI)
   }
 
   combined <- dplyr::bind_rows(lapply(EVENT_TYPES, load_one_event_type))
@@ -80,9 +69,7 @@ load_rmats_master_table <- function(dir_path, invert_dpsi = TRUE) {
   }
 
   n_dup <- sum(duplicated(combined$Event_ID))
-  if (n_dup > 0) {
-    warning(sprintf("%d duplicated Event_ID in %s directory.", n_dup, dir_path))
-  }
+  if (n_dup > 0) warning(sprintf("%d duplicated Event_ID in %s directory.", n_dup, dir_path))
 
   combined %>%
     dplyr::filter(!is.na(p_val_adj)) %>%
@@ -106,571 +93,186 @@ t47d_tables <- load_all_comparisons("t47d")
 
 get_sig_ids <- function(master_data) {
   master_data %>%
-    filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
-    pull(Event_ID)
+    dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
+    dplyr::pull(Event_ID)
 }
 
 sig_ids_mcf7 <- lapply(mcf7_tables, get_sig_ids)
 sig_ids_t47d <- lapply(t47d_tables, get_sig_ids)
 
-
+# unique significant events (pooled over comparisons) - needed for Fig 7A
+get_sig_unique <- function(tables) {
+  dplyr::bind_rows(lapply(tables, function(df) {
+    df %>% dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD)
+  })) %>%
+    dplyr::distinct(Event_ID, EventType)
+}
+mcf7_sig_unique <- get_sig_unique(mcf7_tables)
+t47d_sig_unique <- get_sig_unique(t47d_tables)
 ```
 
-
-```{r}
-
-
-mcf7_sig_all <- dplyr::bind_rows(lapply(mcf7_tables, function(df) {
-  df %>%
+```{r fig6-violin}
+# Figure 6: CTR vs TIS dPSI distributions
+plot_dpsi_asymmetry <- function(master_data, y_limits = c(-1.15, 1.15)) {
+  sig_data <- master_data %>%
     dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD)
-}))
 
-mcf7_sig_unique <- mcf7_sig_all %>%
-  dplyr::distinct(Event_ID, EventType)
-
-mcf7_event_summary <- mcf7_sig_unique %>%
-  dplyr::group_by(EventType) %>%
-  dplyr::summarise(Event_Count = dplyr::n(), .groups = "drop") %>%
-  tidyr::pivot_wider(names_from = EventType, values_from = Event_Count, values_fill = 0)
-
-
-expected_events <- c("SE", "RI", "MXE", "A3SS", "A5SS")
-present_events <- intersect(expected_events, names(mcf7_event_summary))
-mcf7_event_summary <- mcf7_event_summary %>% dplyr::select(dplyr::all_of(present_events))
-
-total_events <- sum(mcf7_event_summary)
-
-DT::datatable(
-  mcf7_event_summary,
-  caption = paste0("Number of significant unique splicing events by type (MCF7) - Total: ", total_events),
-  options = list(
-    dom = 'Brtip',
-    buttons = c('copy', 'csv', 'excel'),
-    scrollX = TRUE
-  ),
-  extensions = "Buttons",
-  class = 'compact cell-border stripe hover',
-  rownames = FALSE
-)
-```
-```{r}
-t47d_sig_all <- dplyr::bind_rows(lapply(t47d_tables, function(df) {
-  df %>%
-    dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD)
-}))
-
-t47d_sig_unique <- t47d_sig_all %>%
-  dplyr::distinct(Event_ID, EventType)
-
-t47d_event_summary <- t47d_sig_unique %>%
-  dplyr::group_by(EventType) %>%
-  dplyr::summarise(Event_Count = dplyr::n(), .groups = "drop") %>%
-  tidyr::pivot_wider(names_from = EventType, values_from = Event_Count, values_fill = 0)
-
-
-expected_events <- c("SE", "RI", "MXE", "A3SS", "A5SS")
-present_events <- intersect(expected_events, names(t47d_event_summary))
-t47d_event_summary <- t47d_event_summary %>% dplyr::select(dplyr::all_of(present_events))
-
-total_events <- sum(t47d_event_summary)
-
-DT::datatable(
-  t47d_event_summary,
-  caption = paste0("Number of significant unique splicing events by type (T47D) - Total: ", total_events),
-  options = list(
-    dom = 'Brtip',
-    buttons = c('copy', 'csv', 'excel'),
-    scrollX = TRUE
-  ),
-  extensions = "Buttons",
-  class = 'compact cell-border stripe hover',
-  rownames = FALSE
-)
-```
-
-```{r}
-
-make_sig_table_full <- function(master_data, label) {
-  master_data %>%
-    dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
-    dplyr::select(Event_ID, EventType, Gene_Name, Position, p_val_adj, dPSI) %>%
-    dplyr::mutate(comparison = label)
+  ggplot(sig_data, aes(x = EventType, y = dPSI, fill = EventType)) +
+    geom_violin(alpha = 0.5, color = NA, trim = FALSE) +
+    geom_boxplot(width = 0.2, alpha = 0.8, outlier.size = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+    scale_fill_manual(values = c("SE" = "#4292C6", "RI" = "#EF3B2C",
+                                 "MXE" = "#41AB5D", "A3SS" = "#807DBA", "A5SS" = "#F16913")) +
+    coord_cartesian(ylim = y_limits) +
+    scale_y_continuous(breaks = seq(-1, 1, by = 0.5)) +
+    labs(y = "CTR vs TIS \u0394PSI", x = "Event Type") +
+    theme_classic(base_family = "Arial", base_size = 18) +
+    theme(legend.position = "none",
+          axis.title = element_text(face = "bold", size = 20),
+          axis.text  = element_text(size = 18, color = "black"))
 }
 
-mcf7_sig_all <- dplyr::bind_rows(lapply(names(mcf7_tables), function(cmp) {
-  make_sig_table_full(mcf7_tables[[cmp]], cmp)
-}))
+p_asym_mcf7 <- plot_dpsi_asymmetry(mcf7_tables[["CTR_vs_TIS"]])
+p_asym_t47d <- plot_dpsi_asymmetry(t47d_tables[["CTR_vs_TIS"]])
 
-t47d_sig_all <- dplyr::bind_rows(lapply(names(t47d_tables), function(cmp) {
-  make_sig_table_full(t47d_tables[[cmp]], cmp)
-}))
+fig_asymmetry <- (p_asym_mcf7 | p_asym_t47d) +
+  plot_annotation(tag_levels = "A",
+                  theme = theme(plot.tag = element_text(size = 24, face = "bold")))
+print(fig_asymmetry)
 
-dedup_sig_table <- function(sig_all, suffix) {
-  sig_all %>%
-    dplyr::group_by(Event_ID, EventType, Gene_Name, Position) %>%
-    dplyr::summarise(
-      !!paste0("comparisons_", suffix) := paste(sort(unique(comparison)), collapse = ", "),
-      !!paste0("dPSI_", suffix)        := dPSI[which.min(p_val_adj)],
-      !!paste0("p_val_adj_", suffix)   := min(p_val_adj),
-      .groups = "drop"
+ggsave("dPSI_asymmetry_TIS_clean.png", fig_asymmetry,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+```{r fig7A-donut}
+plot_data <- dplyr::bind_rows(
+  mcf7_sig_unique %>% dplyr::select(EventType) %>% dplyr::mutate(CellLine = "MCF7"),
+  t47d_sig_unique %>% dplyr::select(EventType) %>% dplyr::mutate(CellLine = "T47D")
+) %>%
+  dplyr::count(CellLine, EventType, name = "Count") %>%
+  dplyr::group_by(CellLine) %>%
+  dplyr::mutate(Prop = Count / sum(Count)) %>%
+  dplyr::ungroup()
+
+make_donut <- function(df, title_text) {
+  ggplot(df, aes(x = 2, y = Prop, fill = EventType)) +
+    geom_bar(stat = "identity", width = 1, color = "white", linewidth = 0.8) +
+    coord_polar(theta = "y", start = 0) +
+    xlim(0.6, 2.5) +
+    scale_fill_manual(
+      values = c("SE" = "#4292C6", "RI" = "#EF3B2C", "MXE" = "#41AB5D",
+                 "A3SS" = "#807DBA", "A5SS" = "#F16913"),
+      name = "Event types", drop = FALSE
+    ) +
+    labs(title = title_text) +
+    theme_void(base_family = "Arial") +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12, margin = margin(b = 4)),
+      legend.title = element_text(face = "bold", size = 9),
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(4, "mm"),
+      legend.margin = margin(0, 0, 0, 0),
+      plot.margin = margin(2, 2, 2, 2, "mm")
+    ) +
+    geom_text(
+      aes(label = ifelse(Prop > 0.02, scales::percent(Prop, accuracy = 0.1), "")),
+      position = position_stack(vjust = 0.5),
+      size = 2.9, fontface = "bold", color = "#222222", family = "Arial"
     )
 }
 
-mcf7_sig_dedup <- dedup_sig_table(mcf7_sig_all, "MCF7")
-t47d_sig_dedup <- dedup_sig_table(t47d_sig_all, "T47D")
+p_mcf7 <- make_donut(dplyr::filter(plot_data, CellLine == "MCF7"), "MCF7") + labs(tag = "A")
+p_t47d <- make_donut(dplyr::filter(plot_data, CellLine == "T47D"), "T47D")
 
-overlap_genes <- dplyr::inner_join(
-  mcf7_sig_dedup,
-  t47d_sig_dedup %>% dplyr::select(Event_ID, comparisons_T47D, dPSI_T47D, p_val_adj_T47D),
-  by = "Event_ID"
-) %>%
-  dplyr::mutate(
-    dPSI_MCF7      = round(dPSI_MCF7, 3),
-    dPSI_T47D      = round(dPSI_T47D, 3),
-    p_val_adj_MCF7 = signif(p_val_adj_MCF7, 3),
-    p_val_adj_T47D = signif(p_val_adj_T47D, 3)
-  ) %>%
-  dplyr::arrange(Gene_Name, Event_ID)
+panel_A_grid <- (p_mcf7 + guide_area() + p_t47d) +
+  plot_layout(widths = c(1, 0.35, 1), guides = "collect") &
+  theme(plot.tag = element_text(family = "Arial", face = "bold", size = 16))
 
-datatable(
-  overlap_genes,
-  caption = "Significant splicing events and their genes in both cell lines",
-  extensions = c("FixedColumns", "Buttons"),
-  filter = "top",
-  options = list(
-    dom = 'Bfrtip', buttons = c('excel', 'pdf', 'csv'),
-    scrollX = TRUE, pageLength = 4, fixedColumns = list(leftColumns = 3)
-  ),
-  class = 'compact cell-border stripe hover',
-  rownames = FALSE
-) %>%
-  formatStyle(
-    c('dPSI_MCF7', 'dPSI_T47D'),
-    backgroundColor = styleInterval(c(-DPSI_THRESHOLD, DPSI_THRESHOLD), c('#FADBD8', 'white', '#D1F2EB'))
-  )
-  
+print(panel_A_grid)
+ggsave("panel_A_splicing_types.png", panel_A_grid,
+       width = 160, height = 65, units = "mm", dpi = 300, bg = "white")
 ```
 
-## plots
+```{r fig7B-euler}
+sig_mcf7_clean <- setNames(sig_ids_mcf7, c("CTR vs\nTIS", "TIS vs\nREPOP", "CTR vs\nREPOP"))
+sig_t47d_clean <- setNames(sig_ids_t47d, c("CTR vs\nTIS", "TIS vs\nREPOP", "CTR vs\nREPOP"))
 
-
-```{r venn-final, fig.width=18, fig.height=6.5}
-
-venn_fill <- scale_fill_gradient(low = "white", high = "#4292C6")
-
-venn_theme <- theme(
-  legend.position = "none",
-  plot.title  = element_text(hjust = 0.5, face = "bold", size = 20,
-                             margin = margin(b = 15)),
-  plot.margin = margin(15, 45, 15, 45)   
-)
-
-venn_clip <- coord_sf(clip = "off")       
-
-sig_mcf7_named <- setNames(sig_ids_mcf7, c("CTR vs TIS", "TIS vs REPOP", "CTR vs REPOP"))
-sig_t47d_named <- setNames(sig_ids_t47d, c("CTR vs TIS", "TIS vs REPOP", "CTR vs REPOP"))
-
-make_venn_panel <- function(sets, title) {
-  ggVennDiagram(sets, label_alpha = 0, set_size = 6, label_size = 5.5,
-                edge_size = 0.7) +
-    venn_fill + venn_clip + labs(title = title) + venn_theme
-}
-
-p_mcf7_all  <- make_venn_panel(sig_mcf7_named, "MCF7\nSplicing events")
-p_t47d_all  <- make_venn_panel(sig_t47d_named, "T47D\nSplicing events")
-p_mcf7_t47d <- make_venn_panel(
-  list(MCF7 = unique(unlist(sig_ids_mcf7)),
-       T47D = unique(unlist(sig_ids_t47d))),
-  "MCF7 vs T47D\nShared TIS and REPOP splicing events"
-) 
-
-fig_venn_all <- (p_mcf7_all | p_t47d_all | p_mcf7_t47d) +
-  plot_layout(widths = c(1, 1, 0.8)) 
-
-fig_venn_all
-
-ggsave("venn_mcf7_t47d_all.png", fig_venn_all, width = 18, height = 6.5, dpi = 300, bg = "white")
-#ggsave("venn_mcf7_t47d_all.pdf", fig_venn_all, width = 18, height = 6.5)
-```
-
-```{r fig.width=18, fig.height=6.5}
-
-sig_mcf7_named <- setNames(sig_ids_mcf7, c("CTR vs TIS", "TIS vs REPOP", "CTR vs REPOP"))
-sig_t47d_named <- setNames(sig_ids_t47d, c("CTR vs TIS", "TIS vs REPOP", "CTR vs REPOP"))
-
-make_euler_panel <- function(sets, title_text) {
+make_euler_panel_clean <- function(sets, title_text) {
   fit <- euler(sets)
-  
-  p <- plot(fit,
-            quantities = list(cex = 0.95),
-            labels = list(cex = 0.95),
-            edges = list(lwd = 1.2),
-            fills = list(fill = c("#DEEBF7", "#9ECAE1", "#4292C6"), alpha = 0.7),
-            padding = grid::unit(2, "lines") 
+  p <- plot(
+    fit,
+    quantities = list(cex = 1.4, fontfamily = "Arial"),
+    labels     = list(cex = 1.35, fontfamily = "Arial"),
+    edges      = list(lwd = 1.0, col = "black"),
+    fills      = list(fill = c("#DEEBF7", "#9ECAE1", "#4292C6"), alpha = 0.7),
+    padding    = grid::unit(1.5, "lines"),
+    adjust_labels = FALSE
   )
   wrap_elements(p) +
     ggtitle(title_text) +
-    theme(
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 18, 
-                                lineheight = 1.2, margin = margin(b = 10)),
-      plot.margin = margin(10, 25, 10, 25) 
-    )
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 26,
+                                    lineheight = 1.2, margin = margin(b = 10)),
+          plot.margin = margin(5, 15, 5, 15))
 }
 
-p_mcf7_all  <- make_euler_panel(sig_mcf7_named, "MCF7\nSplicing events")
-p_t47d_all  <- make_euler_panel(sig_t47d_named, "T47D\nSplicing events")
-
-p_mcf7_t47d <- make_euler_panel(
+p_mcf7_all  <- make_euler_panel_clean(sig_mcf7_clean, "MCF7\nSplicing events")
+p_t47d_all  <- make_euler_panel_clean(sig_t47d_clean, "T47D\nSplicing events")
+p_mcf7_t47d <- make_euler_panel_clean(
   list(MCF7 = unique(unlist(sig_ids_mcf7)),
        T47D = unique(unlist(sig_ids_t47d))),
-  "MCF7 vs T47D\nShared TIS and REPOP splicing events"
-) 
+  "MCF7 vs T47D\nShared splicing events"
+)
 
-fig_euler_all <- (p_mcf7_all | p_t47d_all | p_mcf7_t47d) +
-  plot_layout(widths = c(1, 1, 1.2)) 
+p_mcf7_tagged <- p_mcf7_all + labs(tag = "B")
+
+fig_euler_all <- (p_mcf7_tagged | p_t47d_all | p_mcf7_t47d) +
+  plot_layout(widths = c(1, 1, 1.15)) &
+  theme(plot.tag = element_text(family = "Arial", face = "bold", size = 46),
+        plot.tag.position = c(0.06, 0.94))
 
 print(fig_euler_all)
-
-ggsave("euler_mcf7_t47d_all_eulerr.png", fig_euler_all, width = 20, height = 7, dpi = 300, bg = "white")
-#ggsave("euler_mcf7_t47d_all_eulerr.pdf", fig_euler_all, width = 20, height = 7)
-
+ggsave("panel_B_euler_mcf7_t47d.png", fig_euler_all,
+       width = 20, height = 7, dpi = 300, bg = "white")
 ```
 
-```{r}
-venn_fill <- scale_fill_gradient(low = "white", high = "#4292C6")
+```{r fig7C-euler}
+sets_mcf7_c <- list("CTR vs\nTIS"   = sig_ids_mcf7[["CTR_vs_TIS"]],
+                    "TIS vs\nREPOP" = sig_ids_mcf7[["TIS_vs_REPOP"]])
+sets_t47d_c <- list("CTR vs\nTIS"   = sig_ids_t47d[["CTR_vs_TIS"]],
+                    "TIS vs\nREPOP" = sig_ids_t47d[["TIS_vs_REPOP"]])
 
-venn_theme <- theme_void() + theme(
-  legend.position = "none", 
-  plot.title  = element_text(hjust = 0.5, face = "bold", size = 18,
-                             margin = margin(b = 15)),
-  plot.margin = margin(15, 15, 15, 15)
-)
-
-get_venn_bbox <- function(sets) {
-  edge <- venn_setedge(process_data(Venn(sets)))
-  g <- edge[["geometry"]]
-  if (!is.null(g)) {
-    bb <- sf::st_bbox(g)
-    list(xmin = bb[["xmin"]], xmax = bb[["xmax"]],
-         ymin = bb[["ymin"]], ymax = bb[["ymax"]])
-  } else {
-    list(xmin = min(edge$X), xmax = max(edge$X),
-         ymin = min(edge$Y), ymax = max(edge$Y))
-  }
-}
-
-make_venn_outside <- function(sets, title, label_size = 5.5,
-                              set_label_size = 6.5, gap = 0.1, pad = 0.4) {
-
-  bb  <- get_venn_bbox(sets)
-  lab <- venn_setlabel(process_data(Venn(sets)))
-  
-  lab <- lab[order(-lab$Y), ]
-
-  w <- bb$xmax - bb$xmin
-  h <- bb$ymax - bb$ymin
-  
-  xmid <- (bb$xmin + bb$xmax) / 2
-  ymid <- (bb$ymin + bb$ymax) / 2
-  
-  max_dist_x <- (w / 2) + (w * pad)
-  max_dist_y <- (h / 2) + (h * 0.15)
-
-  suppressMessages(
-    ggVennDiagram(sets, label_alpha = 0, set_size = 0, 
-                  label_size = label_size, edge_size = 0.8) +
-      venn_fill +
-      annotate("text", x = bb$xmin - (w * gap), y = lab$Y[1],
-               label = lab$name[1], size = set_label_size, hjust = 1) +
-      annotate("text", x = bb$xmin - (w * gap), y = lab$Y[2],
-               label = lab$name[2], size = set_label_size, hjust = 1) +
-      coord_sf(xlim = c(xmid - max_dist_x, xmid + max_dist_x),
-               ylim = c(ymid - max_dist_y, ymid + max_dist_y),
-               expand = FALSE, clip = "off") +
-      labs(title = title) +
-      venn_theme
+make_euler_c_panel <- function(sets, title_text) {
+  fit <- euler(sets)
+  p <- plot(
+    fit,
+    quantities = list(cex = 1.5, fontfamily = "Arial"),
+    labels     = list(cex = 1.5, fontfamily = "Arial"),
+    edges      = list(lwd = 1.0, col = "black"),
+    fills      = list(fill = c("#DEEBF7", "#9ECAE1"), alpha = 0.75),
+    padding    = grid::unit(1.5, "lines"),
+    adjust_labels = FALSE
   )
+  wrap_elements(p) +
+    ggtitle(title_text) +
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 32,
+                                    lineheight = 1.2, margin = margin(b = 10)),
+          plot.margin = margin(5, 20, 5, 20))
 }
 
-p_mcf7_ctrtis_tisrepop <- make_venn_outside(
-  sets  = list("CTR vs TIS"   = sig_ids_mcf7[["CTR_vs_TIS"]],
-               "TIS vs REPOP" = sig_ids_mcf7[["TIS_vs_REPOP"]]),
-  title = "MCF7\nShared TIS and REPOP splicing events"
-)
+p_c_mcf7 <- make_euler_c_panel(sets_mcf7_c, "MCF7") + labs(tag = "C")
+p_c_t47d <- make_euler_c_panel(sets_t47d_c, "T47D")
 
-print(p_mcf7_ctrtis_tisrepop)
+panel_C <- (p_c_mcf7 | p_c_t47d) +
+  plot_layout(widths = c(1, 1)) +
+  plot_annotation(title = "Shared TIS and REPOP splicing events") &
+  theme(plot.tag = element_text(family = "Arial", face = "bold", size = 46),
+        plot.tag.position = c(0.045, 0.94),
+        plot.title = element_text(family = "Arial", face = "bold", size = 22,
+                                  hjust = 0.5, margin = margin(b = 12)))
 
-ggsave("venn_mcf7_ctrtis_tisrepop.png", p_mcf7_ctrtis_tisrepop,
-       width = 9, height = 6, dpi = 300, bg = "white")
+print(panel_C)
+ggsave("panel_C_shared_events_matching_B.png", panel_C,
+       width = 20, height = 7, dpi = 300, bg = "white")
 ```
-
-```{r}
-
-venn_fill <- scale_fill_gradient(low = "white", high = "#4292C6")
-
-venn_theme <- theme_void() + theme(
-  legend.position = "none", 
-  plot.title  = element_text(hjust = 0.5, face = "bold", size = 18,
-                             margin = margin(b = 15)),
-  plot.margin = margin(15, 15, 15, 15)
-)
-
-get_venn_bbox <- function(sets) {
-  edge <- venn_setedge(process_data(Venn(sets)))
-  g <- edge[["geometry"]]
-  if (!is.null(g)) {
-    bb <- sf::st_bbox(g)
-    list(xmin = bb[["xmin"]], xmax = bb[["xmax"]],
-         ymin = bb[["ymin"]], ymax = bb[["ymax"]])
-  } else {
-    list(xmin = min(edge$X), xmax = max(edge$X),
-         ymin = min(edge$Y), ymax = max(edge$Y))
-  }
-}
-
-make_venn_outside <- function(sets, title, label_size = 5.5,
-                              set_label_size = 6.5, gap = 0.1, pad = 0.4) {
-
-  bb  <- get_venn_bbox(sets)
-  lab <- venn_setlabel(process_data(Venn(sets)))
-  
-  lab <- lab[order(-lab$Y), ]
-
-  w <- bb$xmax - bb$xmin
-  h <- bb$ymax - bb$ymin
-  
-  xmid <- (bb$xmin + bb$xmax) / 2
-  ymid <- (bb$ymin + bb$ymax) / 2
-  
-
-  max_dist_x <- (w / 2) + (w * pad)
-  max_dist_y <- (h / 2) + (h * 0.15)
-
-  suppressMessages(
-    ggVennDiagram(sets, label_alpha = 0, set_size = 0, 
-                  label_size = label_size, edge_size = 0.8) +
-      venn_fill +
-      annotate("text", x = bb$xmin - (w * gap), y = lab$Y[1],
-               label = lab$name[1], size = set_label_size, hjust = 1) +
-      annotate("text", x = bb$xmin - (w * gap), y = lab$Y[2],
-               label = lab$name[2], size = set_label_size, hjust = 1) +
-      coord_sf(xlim = c(xmid - max_dist_x, xmid + max_dist_x),
-               ylim = c(ymid - max_dist_y, ymid + max_dist_y),
-               expand = FALSE, clip = "off") +
-      labs(title = title) +
-      venn_theme
-  )
-}
-
-p_t47d_ctrtis_tisrepop <- make_venn_outside(
-  sets  = list("CTR vs TIS"   = sig_ids_t47d[["CTR_vs_TIS"]],
-               "TIS vs REPOP" = sig_ids_t47d[["TIS_vs_REPOP"]]),
-  title = "T47D\nShared TIS and REPOP splicing events"
-)
-
-print(p_t47d_ctrtis_tisrepop)
-
-ggsave("venn_t47d_ctrtis_tisrepop.png", p_t47d_ctrtis_tisrepop,
-       width = 9, height = 6, dpi = 300, bg = "white")
-```
-
-
-```{r out.width="100%"}
-collect_sig <- function(tables) {
-  dplyr::bind_rows(lapply(names(tables), function(cmp) {
-    tables[[cmp]] %>%
-      dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
-      dplyr::select(Event_ID, Gene_Name, Position, p_val_adj, dPSI) %>%
-      dplyr::mutate(comparison = cmp)
-  }))
-}
-
-mcf7_sig_all <- collect_sig(mcf7_tables)
-t47d_sig_all <- collect_sig(t47d_tables)
-
-overlap_same_cond <- dplyr::inner_join(
-  mcf7_sig_all %>%
-    dplyr::rename(dPSI_MCF7 = dPSI, padj_MCF7 = p_val_adj),
-  t47d_sig_all %>%
-    dplyr::select(Event_ID, comparison,
-                  dPSI_T47D = dPSI, padj_T47D = p_val_adj),
-  by = c("Event_ID", "comparison")
-) %>%
-  dplyr::mutate(
-    dPSI_MCF7 = round(dPSI_MCF7, 3),
-    dPSI_T47D = round(dPSI_T47D, 3),
-    padj_MCF7 = signif(padj_MCF7, 3),
-    padj_T47D = signif(padj_T47D, 3),
-    same_direction = ifelse(sign(dPSI_MCF7) == sign(dPSI_T47D), "yes", "no")
-  ) %>%
-  dplyr::select(comparison, Gene_Name, Event_ID, Position,
-                dPSI_MCF7, dPSI_T47D, same_direction, padj_MCF7, padj_T47D) %>%
-  dplyr::arrange(comparison, Gene_Name, Event_ID)
-
-print(dplyr::count(overlap_same_cond, comparison))
-
-DT::datatable(
-  overlap_same_cond,
-  caption = paste0("Overlapping splicing events in MCF7 and T47D under the same condition (n = ",
-                   nrow(overlap_same_cond), ", genes: ",
-                   dplyr::n_distinct(overlap_same_cond$Gene_Name), ")"),
-  extensions = c("Buttons"),
-  filter = "top",
-  options = list(
-    dom = "Bfrtip",
-    buttons = c("copy", "csv", "excel"),
-    scrollX = FALSE,   
-    autoWidth = TRUE,  
-    pageLength = 15,
-    search = list(regex = TRUE, caseInsensitive = TRUE)
-  ),
-
-  class = "compact cell-border stripe hover", 
-  rownames = FALSE
-) %>%
-  DT::formatStyle(
-    c("dPSI_MCF7", "dPSI_T47D"),
-    backgroundColor = DT::styleInterval(
-      c(-DPSI_THRESHOLD, DPSI_THRESHOLD), c("#FADBD8", "white", "#D1F2EB")
-    )
-  ) %>%
-  DT::formatStyle(
-    "same_direction",
-    fontWeight = "bold",
-    color = DT::styleEqual(c("yes", "no"), c("#005B41", "#C0392B"))
-  ) %>%
-  DT::formatStyle(
-    c("Event_ID", "Position"),
-    `word-break` = 'break-all'
-  )
-```
-
-```{r}
-
-collect_sig <- function(tables) {
-  dplyr::bind_rows(lapply(names(tables), function(cmp) {
-    tables[[cmp]] %>%
-      dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
-      dplyr::select(Event_ID, Gene_Name, Position, p_val_adj, dPSI) %>%
-      dplyr::mutate(comparison = cmp)
-  }))
-}
-
-mcf7_sig_all <- collect_sig(mcf7_tables)
-t47d_sig_all <- collect_sig(t47d_tables)
-
-overlap_same_cond_dir <- dplyr::inner_join(
-  mcf7_sig_all %>%
-    dplyr::rename(dPSI_MCF7 = dPSI, padj_MCF7 = p_val_adj),
-  t47d_sig_all %>%
-    dplyr::select(Event_ID, comparison,
-                  dPSI_T47D = dPSI, padj_T47D = p_val_adj),
-  by = c("Event_ID", "comparison")
-) %>%
-  dplyr::filter(sign(dPSI_MCF7) == sign(dPSI_T47D)) %>%      # same direction
-  dplyr::mutate(
-    direction = ifelse(dPSI_MCF7 > 0, "Up", "Down"),
-    dPSI_MCF7 = round(dPSI_MCF7, 3),
-    dPSI_T47D = round(dPSI_T47D, 3),
-    padj_MCF7 = signif(padj_MCF7, 3),
-    padj_T47D = signif(padj_T47D, 3)
-  ) %>%
-  dplyr::select(comparison, direction, Gene_Name, Event_ID, Position,
-                dPSI_MCF7, dPSI_T47D, padj_MCF7, padj_T47D) %>%
-  dplyr::arrange(comparison, direction, Gene_Name, Event_ID)
-
-print(dplyr::count(overlap_same_cond_dir, comparison, direction))
-
-DT::datatable(
-  overlap_same_cond_dir,
-  caption = paste0("Overlapping splicing events in MCF7 and T47D under the same condition and direction (n = ",
-                   nrow(overlap_same_cond_dir), ", genes: ",
-                   dplyr::n_distinct(overlap_same_cond_dir$Gene_Name), ")"),
-  extensions = c("Buttons", "FixedColumns"),
-  filter = "top",
-  options = list(
-    dom = "Bfrtip",
-    buttons = c("copy", "csv", "excel"),
-    scrollX = TRUE,
-    pageLength = 15,
-    search = list(regex = TRUE, caseInsensitive = TRUE),
-    fixedColumns = list(leftColumns = 3)
-  ),
-  class = "compact cell-border stripe hover",
-  rownames = FALSE
-) %>%
-  DT::formatStyle(
-    c("dPSI_MCF7", "dPSI_T47D"),
-    backgroundColor = DT::styleInterval(
-      c(-DPSI_THRESHOLD, DPSI_THRESHOLD), c("#FADBD8", "white", "#D1F2EB")
-    )
-  ) %>%
-  DT::formatStyle(
-    "direction",
-    fontWeight = "bold",
-    color = DT::styleEqual(c("Up", "Down"), c("#005B41", "#C0392B"))
-  )
-```
-
-```{r}
-
-
-get_sig_events_with_type <- function(tables_list) {
-  dplyr::bind_rows(lapply(tables_list, function(df) {
-    df %>%
-      dplyr::filter(p_val_adj < SIG_THRESHOLD, abs(dPSI) > DPSI_THRESHOLD) %>%
-      dplyr::select(Event_ID, EventType)
-  })) %>%
-    dplyr::distinct(Event_ID, .keep_all = TRUE)
-}
-
-mcf7_events <- get_sig_events_with_type(mcf7_tables) %>%
-  dplyr::count(EventType) %>%
-  dplyr::mutate(CellLine = "MCF7")
-
-t47d_events <- get_sig_events_with_type(t47d_tables) %>%
-  dplyr::count(EventType) %>%
-  dplyr::mutate(CellLine = "T47D")
-
-plot_data <- dplyr::bind_rows(mcf7_events, t47d_events) %>%
-  dplyr::group_by(CellLine) %>%
-  dplyr::mutate(
-    Total = sum(n),
-    Prop = n / Total
-  ) %>%
-  dplyr::ungroup() %>%
-  dplyr::mutate(EventType = factor(EventType, levels = c("SE", "RI", "MXE", "A3SS", "A5SS")))
-
-p_donut <- ggplot(plot_data, aes(x = 2, y = Prop, fill = EventType)) +
-  geom_bar(stat = "identity", width = 1, color = "white", linewidth = 1) +
-  coord_polar(theta = "y") +
-  facet_wrap(~ CellLine) +
-  xlim(0.5, 2.5) +
-  scale_fill_manual(values = c(
-    "SE"   = "#4292C6", 
-    "RI"   = "#EF3B2C", 
-    "MXE"  = "#41AB5D", 
-    "A3SS" = "#807DBA", 
-    "A5SS" = "#F16913"
-  )) +
-  labs(
-    title = "Distribution of significant splicing event types",
-    fill = "Event types"
-  ) +
-  theme_void() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold", size = 18, margin = margin(b = 20)),
-    strip.text = element_text(size = 16, face = "bold", margin = margin(b = 10)),
-    legend.position = "right",
-    legend.title = element_text(face = "bold", size = 14),
-    legend.text = element_text(size = 12),
-    plot.margin = margin(15, 15, 15, 15)
-  ) +
-  geom_text(aes(label = ifelse(Prop > 0.01, scales::percent(Prop, accuracy = 0.1), "")),
-            position = position_stack(vjust = 0.5), size = 4.5, fontface = "bold", color = "#222222")
-
-print(p_donut)
-
-ggsave("rmats_event_types_donut.png", p_donut, width = 10, height = 5, dpi = 300, bg = "white")
-```
-
