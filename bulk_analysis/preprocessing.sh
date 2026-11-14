@@ -25,11 +25,11 @@ for r1 in "$RAW_DIR"/*_1.fastq.gz; do
   # 1. QC of raw reads
   fastqc -t "$THREADS" "$r1" "$r2" -o "$QC_DIR/raw"
 
-  # 2. Trimming (parameters as in the original run; check against Methods 4.2)
+  # 2. Trimming 
   trimmomatic PE -threads "$THREADS" "$r1" "$r2" \
     "$TRIM_DIR/${s}_1_paired.fastq.gz" "$TRIM_DIR/${s}_1_unpaired.fastq.gz" \
     "$TRIM_DIR/${s}_2_paired.fastq.gz" "$TRIM_DIR/${s}_2_unpaired.fastq.gz" \
-    ILLUMINACLIP:"$ADAPTERS":2:25:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:25 \
+    ILLUMINACLIP:"$ADAPTERS":2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36 \
     2> "$TRIM_DIR/${s}_trim.log"
 
   # 3. QC of trimmed reads
