@@ -1,0 +1,11 @@
+name: clean_sashimi
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - pysam
+  - samtools
