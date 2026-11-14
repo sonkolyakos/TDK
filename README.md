@@ -1,6 +1,6 @@
 # From Senescence to Repopulation: Alternative Splicing Dynamics in Breast Cancer Cells
 
-Analysis code for the TDK study of the same title (Ákos Gábor Sonkoly, Molecular Bionics Engineering BSc, Pázmány Péter Catholic University, Faculty of Information Technology and Bionics; Institute of Molecular Life Sciences, HUN-REN RCNS; 2026).
+Analysis code for the TDK study of the same title (Ákos Gábor Sonkoly, Molecular Bionics Engineering BSc, Pázmány Péter Catholic University, Faculty of Information Technology and Bionics; Epigenetics and Genome Editing Laboratory, Institute of Molecular Life Sciences, HUN-REN RCNS; 2026).
 
 The study characterises alternative splicing (AS) in the ER+ breast cancer cell lines **MCF7** and **T47D** across three states: untreated control (**CTR**), therapy-induced senescence (**TIS**) and repopulation (**REPOP**). Gene expression (RSEM + DESeq2) and splicing (rMATS and LeafCutter) are analysed from published bulk RNA-seq data, integrated, and followed across the CTR → TIS → REPOP trajectory.
 
