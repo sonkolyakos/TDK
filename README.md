@@ -57,7 +57,7 @@ Contents of `bulk_analysis/` by analysis step (file names may differ):
 - **ΔPSI = second condition − first condition**: CTR_vs_TIS = TIS − CTR, TIS_vs_REPOP = REPOP − TIS, CTR_vs_REPOP = REPOP − CTR.
 - rMATS reports `IncLevelDifference` = group 1 − group 2, so the loaders multiply it by −1 (`invert_dpsi = TRUE`). This is correct only if the first-named condition is `--b1` in every rMATS run (check the run commands or `b1.txt`).
 - The LeafCutter ΔPSI of a skipping intron is multiplied by −1 when compared with rMATS inclusion levels.
-- LeafCutter introns are assigned to genes through the annotated MCF7 effect-size table; T47D introns are annotated by coordinate matching to it.
+
 
 ## Figure → script map
 
