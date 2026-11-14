@@ -124,7 +124,7 @@ Other R packages: ComplexHeatmap, circlize, eulerr, ggplot2, patchwork, msigdbr,
 
 ## Citation
 
-> Sonkoly, Á. G. *From Senescence to Repopulation: Alternative Splicing Dynamics in Breast Cancer Cells.* TDK study, Pázmány Péter Catholic University, 2026.
+> Sonkoly, Ákos G. *From Senescence to Repopulation: Alternative Splicing Dynamics in Breast Cancer Cells.* TDK study, Pázmány Péter Catholic University, 2026.
 >
 > Bajtai, E. et al. Therapy-induced senescence is a transient drug resistance mechanism in breast cancer. *Mol. Cancer* 24, 128 (2025). doi:10.1186/s12943-025-02310-0
 
