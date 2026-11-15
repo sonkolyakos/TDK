@@ -26,7 +26,7 @@ suppressPackageStartupMessages({
 })
 
 # ====== SET ======
-DGE_INPUT_DIR <- "/home/akos/Desktop/lab/TDK/gene_analysis"
+DGE_INPUT_DIR <- "gene_analysis_PATH"
 
 CELL_CFG <- list(
   t47d = list(
