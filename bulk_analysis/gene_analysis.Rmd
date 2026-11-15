@@ -4,7 +4,6 @@ author: "Sonkoly Akos"
 date: "`r Sys.Date()`"
 output:
   html_document:
-    css: assets/rany_style.css
     df_print: paged
     highlight: tango
     theme: united
@@ -19,66 +18,37 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-
-
 ```{r}
 library(DESeq2)
-library(tidyverse)
-library(airway)
 library(ggplot2)
 library(ggrepel)
 library(dplyr)
 library(EnsDb.Hsapiens.v86)
 library(clusterProfiler)
-library(ReactomePA)
 library(org.Hs.eg.db)
 library(pheatmap)
 library(grid)
-library(ashr)
 ```
+## Step 1: preparing the data
 
 ```{r}
+raw_counts <- read.table("PATH", 
+                         header = TRUE, 
+                         row.names = 1, 
+                         stringsAsFactors = FALSE,
+                         check.names = FALSE)
 
-input_dir <- readline(
-  prompt = "Enter the path to the directory containing rsem_counts.txt and sample_info.csv: "
-)
-
-counts_file <- file.path(input_dir, "rsem_counts.txt")
-metadata_file <- file.path(input_dir, "sample_info.csv")
-
-if (!file.exists(counts_file)) {
-  stop("Could not find: ", counts_file)
-}
-
-if (!file.exists(metadata_file)) {
-  stop("Could not find: ", metadata_file)
-}
-
-# Read RSEM counts
-raw_counts <- read.table(
-  counts_file,
-  header = TRUE,
-  row.names = 1,
-  stringsAsFactors = FALSE,
-  check.names = FALSE
-)
-
-# Clean sample names
 colnames(raw_counts) <- gsub("\\.genes\\.results", "", colnames(raw_counts))
-colnames(raw_counts) <- gsub("-", ".", colnames(raw_counts))
-colnames(raw_counts) <- gsub("_$", "", colnames(raw_counts))
 
-# Round counts
+colnames(raw_counts) <- gsub("-", ".", colnames(raw_counts))
+
+colnames(raw_counts) <- gsub("_$", "", colnames(raw_counts))
 counts_data <- round(raw_counts)
 
-# Read sample metadata
-colData <- read.csv(
-  metadata_file,
-  stringsAsFactors = FALSE,
-  row.names = 1
-)
+colData <- read.csv('/home/akos/Desktop/lab/Föt/sample_info.csv', 
+                    stringsAsFactors = FALSE, 
+                    row.names = 1)
 
-# Check that all count-matrix samples have metadata
 all(colnames(counts_data) %in% rownames(colData))
 
 ```
@@ -103,10 +73,7 @@ dds <- dds[keep,]
 
 dds <- DESeq(dds) 
 
-resultsNames(dds) 
 fl0_res <- lfcShrink(dds, coef="Condition_TIS_vs_CTR", type="apeglm") 
-
-summary(fl0_res)
 ```
 
 ```{r}
@@ -169,7 +136,7 @@ my_similarity_heatmap <- function(dist_matrix, anno_var, anno_label, cutoffthres
   )
 }
 
-# rlog transformation
+# --- rlog transformation ---
 rld <- rlog(dds, blind = TRUE)
 
 conditions <- colData_filtered$Condition
@@ -194,18 +161,7 @@ colnames(rld) <- clean_names
 condition_factor <- factor(conditions, levels = c("CTR", "TIS", "REPOP"))
 names(condition_factor) <- clean_names
 
-# 1. Euclidean heatmap 
-mat_dist <- dist(t(assay(rld)))
-
-my_similarity_heatmap(
-  dist_matrix = mat_dist,
-  anno_var    = condition_factor,
-  anno_label  = "id",
-  cutoffthres = 1.55,
-  title       = "After Gene Filtering (Euclidean Distances)"
-)
-
-# 2. Pearson-correlation heatmap 
+# --- Pearson correlation heatmap ---
 mat_cor      <- cor(assay(rld), method = "pearson")
 mat_cor_dist <- as.dist(1 - mat_cor)
 
@@ -216,4 +172,392 @@ my_similarity_heatmap(
   cutoffthres = 1.55,
   title       = "After Gene Filtering (Pearson corralation)"
 )
+```
+
+```{r}
+
+fl0_res_df <- as.data.frame(fl0_res)
+gen_ids <- rownames(fl0_res_df)
+gen_clean <- gsub("\\..*", "", gen_ids)
+
+gene_map <- ensembldb::select(EnsDb.Hsapiens.v86, 
+                              keys = gen_clean, 
+                              keytype = "GENEID", 
+                              columns = c("GENEID", "SYMBOL"))
+
+gene_map <- gene_map[!duplicated(gene_map$GENEID), ]
+
+fl0_res_df$gene_name <- gene_map$SYMBOL[match(gen_clean, gene_map$GENEID)]
+
+
+fl0_res_df$gene_name[is.na(fl0_res_df$gene_name)] <- gen_ids[is.na(fl0_res_df$gene_name)]
+```
+
+```{r}
+my_volcano_clean <- function(results_deseq, 
+                             lfc_thres  = 1,
+                             plot_title = NULL,
+                             label_fc   = 2,      
+                             label_padj = 1e-50, 
+                             top_n      = 20,
+                             fc_label   = "TIS/CTR") {   
+  
+  df <- results_deseq %>%
+    dplyr::mutate(
+      sig_color = dplyr::case_when(
+        log2FoldChange >  lfc_thres ~ "up",
+        log2FoldChange < -lfc_thres ~ "down",
+        TRUE ~ "ns"
+      ),
+      neg_log10_padj = -log10(padj)
+    )
+  
+  label_up <- df %>%
+    dplyr::filter(log2FoldChange > label_fc, padj < label_padj) %>%
+    dplyr::slice_max(neg_log10_padj, n = ceiling(top_n / 2))
+  
+  label_down <- df %>%
+    dplyr::filter(log2FoldChange < -label_fc, padj < label_padj) %>%
+    dplyr::slice_max(neg_log10_padj, n = floor(top_n / 2))
+  
+  label_df <- dplyr::bind_rows(label_up, label_down)
+  
+  ggplot(df, aes(x = log2FoldChange, y = neg_log10_padj)) +
+    geom_point(aes(color = sig_color), size = 1.2, alpha = 0.7) +
+    scale_color_manual(values = c("up" = "#D85A30", "down" = "#378ADD", "ns" = "#888780")) +
+    geom_vline(xintercept = c(-lfc_thres, lfc_thres),
+               col = "black", linetype = "dashed", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(0.05),
+               col = "black", linetype = "dashed", linewidth = 0.4) +
+    ggrepel::geom_text_repel(
+      data               = label_df,
+      aes(label          = gene_name),
+      size               = 4.5,              # Gene label size INCREASED (3.2 -> 4.5)
+      color              = "black",
+      fontface           = "italic",
+      box.padding        = 0.5,      
+      point.padding      = 0.3,      
+      force              = 3,        
+      force_pull         = 0.5,
+      max.overlaps       = Inf,      
+      segment.size       = 0.3,
+      segment.color      = "grey40",
+      min.segment.length = 0.2,
+      direction          = "y",
+      nudge_x            = ifelse(label_df$log2FoldChange > 0, 1.5, -1.5)
+    ) +
+    scale_x_continuous(limits = c(-12, 12), breaks = seq(-10, 10, 5)) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+    labs(
+      x     = bquote(log[2]*"FC ("*.(fc_label)*")"),
+      y     = expression(-log[10]*"(Adjusted p-value)"),
+      title = plot_title
+    ) +
+    theme_classic(base_size = 16) +          # Base font size INCREASED (12 -> 16)
+    theme(
+      legend.position  = "none",
+      axis.text        = element_text(color = "black", size = 14), # Axis tick label size
+      axis.title       = element_text(size = 16),                  # Axis title size
+      plot.title       = element_text(face = "bold", size = 18),   # Title size INCREASED (13 -> 18)
+      panel.grid.major = element_line(color = "#DDDDDD", linewidth = 0.2)
+    )
+}
+
+# Run as before:
+target_df <- as.data.frame(fl0_res_df) 
+target_clean <- target_df %>%
+  dplyr::filter(!is.na(padj), !is.na(log2FoldChange))
+
+p <- my_volcano_clean(
+  results_deseq = target_clean,
+  lfc_thres  = 1,
+  label_fc   = 2,      
+  label_padj = 1e-50, 
+  top_n      = 20,
+  plot_title = "MCF7: TIS vs CTR"
+)
+print(p)
+ggsave("volcano_plot_MCF7.png", plot = p, width = 8, height = 6, dpi = 300, bg = "white")     
+
+```
+## GSEA
+
+```{r}
+plot_gsea_dotplot <- function(gsea_res, source_label = NULL, contrast_label = NULL, showCategory = 10) {
+  
+  if (is.null(contrast_label)) {
+    contrast_label <- source_label
+  }
+  
+  df <- as.data.frame(gsea_res)
+  
+  if (nrow(df) == 0) {
+    message("No significant result (", contrast_label, ")")
+    return(invisible(NULL))
+  }
+  
+  df$Count <- sapply(strsplit(as.character(df$core_enrichment), "/"), length)
+  df$GeneRatioNum <- df$Count / as.numeric(df$setSize)
+  df$.sign <- ifelse(df$NES > 0, "activated", "suppressed")
+  
+  df_up   <- df %>% dplyr::filter(.sign == "activated")  %>% dplyr::arrange(p.adjust) %>% head(showCategory)
+  df_down <- df %>% dplyr::filter(.sign == "suppressed") %>% dplyr::arrange(p.adjust) %>% head(showCategory)
+  df_plot <- dplyr::bind_rows(df_up, df_down)
+  
+  df_plot <- df_plot %>% dplyr::arrange(desc(.sign), GeneRatioNum)
+  df_plot$Description <- factor(df_plot$Description, levels = unique(df_plot$Description))
+  df_plot$.sign <- factor(df_plot$.sign, levels = c("suppressed", "activated"))
+  
+  p <- ggplot(df_plot, aes(x = GeneRatioNum, y = Description)) +
+    geom_point(aes(size = Count, fill = p.adjust), shape = 21, color = "black", stroke = 0.5) +
+    scale_fill_gradient(low = "#d76565", high = "#5c81ab", name = "p.adjust", trans = "log10") +
+    guides(
+      fill = guide_colorbar(order = 1, reverse = TRUE),
+      size = guide_legend(order = 2, title = "Count")
+    ) +
+    facet_grid(. ~ .sign) +
+    theme_bw(base_size = 16) +
+    labs(
+      title = paste0("MCF7: ", contrast_label),
+      x = "GeneRatio",
+      y = NULL
+    ) +
+    scale_x_continuous(expand = expansion(mult = c(0.1, 0.45))) +
+    theme(
+      axis.text.y          = element_text(lineheight = 0.9, color = "black"),
+      panel.grid.major.y   = element_line(color = "grey90", linewidth = 0.5),
+      legend.position      = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box           = "horizontal",
+      
+      # Single, final background definition for the black frame
+      legend.background  = element_rect(fill = alpha("white", 0.9), color = "black", linewidth = 0.3),
+      
+      # Wider keys so that the bold title does not extend beyond the frame
+      legend.key.width   = unit(0.9, "cm"), 
+      legend.key.height  = unit(0.5, "cm"), 
+      
+      legend.title       = element_text(face = "bold"),
+      legend.text        = element_text(),
+      
+      # Single, final margin and spacing settings
+      legend.margin      = margin(4, 4, 4, 4),
+      legend.spacing.x   = unit(0.3, "cm")
+    )
+  print(p)
+  return(p)
+}
+
+```
+
+
+```{r}
+
+df <- fl0_res_df 
+
+
+df_clean <- df[!is.na(df$gene_name), ]
+
+df_unique <- df_clean[order(df_clean$padj), ] 
+df_unique <- df_unique[!duplicated(df_unique$gene_name), ] 
+
+gene_list <- df_unique$log2FoldChange
+names(gene_list) <- df_unique$gene_name
+gene_list <- sort(na.omit(gene_list), decreasing = TRUE)
+```
+
+
+### KEGG
+
+```{r}
+ids <- bitr(names(gene_list), 
+            fromType = "SYMBOL", 
+            toType   = "ENTREZID", 
+            OrgDb    = org.Hs.eg.db)
+
+dedup_ids <- ids[!duplicated(ids[c("SYMBOL")]),]
+
+kegg_df <- data.frame(SYMBOL = names(gene_list), LFC = as.numeric(gene_list))
+kegg_df <- kegg_df[kegg_df$SYMBOL %in% dedup_ids$SYMBOL,]
+kegg_df$ENTREZID <- dedup_ids$ENTREZID[match(kegg_df$SYMBOL, dedup_ids$SYMBOL)]
+
+kegg_gene_list <- kegg_df$LFC
+names(kegg_gene_list) <- kegg_df$ENTREZID
+kegg_gene_list <- sort(kegg_gene_list, decreasing = TRUE)
+
+kk2 <- gseKEGG(geneList     = kegg_gene_list,
+               organism     = "hsa",
+               minGSSize    = 10,
+               maxGSSize    = 500,
+               pvalueCutoff = 0.05, 
+               verbose      = FALSE, 
+               pAdjustMethod = "fdr",
+               keyType      = "ncbi-geneid")
+```
+
+```{r}
+
+p <- plot_gsea_dotplot(kk2, "KEGG", "CTR vs TIS")
+ggsave("mcf7_kegg_ctr_tis.png", plot = p, width = 8, height = 6, dpi = 300, bg = "white")
+```
+
+### WikiPathways
+
+```{r}
+wiki_res <- gseWP(geneList = kegg_gene_list, 
+                  organism = "Homo sapiens",
+                  pvalueCutoff = 0.05,
+                  pAdjustMethod = "fdr",
+                  verbose = FALSE)
+```
+
+```{r}
+clusterProfiler::dotplot(wiki_res, 
+                         showCategory = 8, 
+                         split = ".sign", 
+                         font.size = 8,
+                         label_format = 45) + 
+  facet_grid(.~.sign) + theme(axis.text.y = element_text(lineheight = 1.3)) 
+```
+
+```{r}
+# ==========================================
+# 1. Extracting the REPOP vs TIS results
+# ==========================================
+# TIS is set as the reference level
+dds$Condition <- relevel(dds$Condition, ref = "TIS")
+
+# Re-run the test with the new reference
+dds <- nbinomWaldTest(dds)
+
+# Extract the log2FoldChange values for the REPOP vs TIS contrast
+repop_tis_res <- lfcShrink(dds, coef="Condition_REPOP_vs_TIS", type="apeglm") 
+repop_tis_df <- as.data.frame(repop_tis_res)
+
+# ==========================================
+# 2. Assigning gene names (SYMBOL)
+# ==========================================
+gen_ids_rt <- rownames(repop_tis_df)
+gen_clean_rt <- gsub("\\..*", "", gen_ids_rt)
+
+gene_map_rt <- ensembldb::select(EnsDb.Hsapiens.v86, 
+                                 keys = gen_clean_rt, 
+                                 keytype = "GENEID", 
+                                 columns = c("GENEID", "SYMBOL"))
+
+# Remove duplicates
+gene_map_rt <- gene_map_rt[!duplicated(gene_map_rt$GENEID), ]
+
+repop_tis_df$gene_name <- gene_map_rt$SYMBOL[match(gen_clean_rt, gene_map_rt$GENEID)]
+repop_tis_df$gene_name[is.na(repop_tis_df$gene_name)] <- gen_ids_rt[is.na(repop_tis_df$gene_name)]
+
+# ==========================================
+# 3. Filtering the data and drawing the volcano plot
+# ==========================================
+target_clean_rt <- repop_tis_df %>%
+  dplyr::filter(!is.na(padj), !is.na(log2FoldChange))
+
+p_rt <- my_volcano_clean(
+  results_deseq = target_clean_rt,
+  lfc_thres  = 1,
+  label_fc   = 2,      
+  label_padj = 1e-50, 
+  top_n      = 20,
+  plot_title = "MCF7: REPOP vs TIS",
+  fc_label   = "REPOP/TIS"
+)
+
+print(p_rt)
+
+# Save the figure
+ggsave("volcano_plot_REPOP_vs_TIS.png", plot = p_rt, width = 8, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+df_clean_rt <- repop_tis_df[!is.na(repop_tis_df$gene_name), ]
+df_unique_rt <- df_clean_rt[order(df_clean_rt$padj), ] 
+df_unique_rt <- df_unique_rt[!duplicated(df_unique_rt$gene_name), ] 
+
+# Build the LFC-based vector
+gene_list_rt <- df_unique_rt$log2FoldChange
+names(gene_list_rt) <- df_unique_rt$gene_name
+gene_list_rt <- sort(na.omit(gene_list_rt), decreasing = TRUE)
+
+# SYMBOL -> ENTREZID conversion
+ids_rt <- bitr(names(gene_list_rt), 
+               fromType = "SYMBOL", 
+               toType   = "ENTREZID", 
+               OrgDb    = org.Hs.eg.db)
+
+dedup_ids_rt <- ids_rt[!duplicated(ids_rt$SYMBOL), ]
+
+kegg_df_rt <- data.frame(SYMBOL = names(gene_list_rt), LFC = as.numeric(gene_list_rt))
+kegg_df_rt <- kegg_df_rt[kegg_df_rt$SYMBOL %in% dedup_ids_rt$SYMBOL, ]
+kegg_df_rt$ENTREZID <- dedup_ids_rt$ENTREZID[match(kegg_df_rt$SYMBOL, dedup_ids_rt$SYMBOL)]
+
+# Final ENTREZID-based list, sorted in decreasing order
+kegg_gene_list_rt <- kegg_df_rt$LFC
+names(kegg_gene_list_rt) <- kegg_df_rt$ENTREZID
+kegg_gene_list_rt <- sort(kegg_gene_list_rt, decreasing = TRUE)
+```
+
+```{r}
+# ==========================================
+# 5. Running and plotting GSEA (REPOP vs TIS)
+# ==========================================
+
+# --- KEGG ---
+kk_rt <- gseKEGG(geneList     = kegg_gene_list_rt,
+                 organism     = "hsa",
+                 minGSSize    = 10,
+                 maxGSSize    = 500,
+                 pvalueCutoff = 0.05, 
+                 verbose      = FALSE, 
+                 pAdjustMethod = "fdr",
+                 keyType      = "ncbi-geneid")
+
+# Call the new, cleaner plotting function instead of the old long code
+p_kegg_rt <- plot_gsea_dotplot(kk_rt, "KEGG", "REPOP vs TIS", showCategory = 8)
+
+# --- WikiPathways ---
+wiki_rt <- gseWP(geneList = kegg_gene_list_rt, 
+                 organism = "Homo sapiens",
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "fdr",
+                 verbose = FALSE)
+
+# Call the new, cleaner plotting function
+p_wiki_rt <- plot_gsea_dotplot(wiki_rt, "WikiPathways", "REPOP vs TIS", showCategory = 8)
+
+ggsave("mcf7_gsea_repop_tis.png", plot = p_kegg_rt, width = 8, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+# ==========================================
+# 1. Extracting the CTR vs REPOP results
+# ==========================================
+# (added: restore the CTR reference level, otherwise the Condition_REPOP_vs_CTR coefficient does not exist)
+dds$Condition <- relevel(dds$Condition, ref = "CTR")
+dds <- nbinomWaldTest(dds)
+
+# Extract the log2FoldChange values for the REPOP vs CTR contrast with lfcShrink
+repop_res <- lfcShrink(dds, coef="Condition_REPOP_vs_CTR", type="apeglm") 
+repop_res_df <- as.data.frame(repop_res)
+
+# ==========================================
+# 2. Assigning gene names (SYMBOL)
+# ==========================================
+gen_ids_repop <- rownames(repop_res_df)
+gen_clean_repop <- gsub("\\..*", "", gen_ids_repop)
+
+gene_map_repop <- ensembldb::select(EnsDb.Hsapiens.v86, 
+                                    keys = gen_clean_repop, 
+                                    keytype = "GENEID", 
+                                    columns = c("GENEID", "SYMBOL"))
+
+# Remove duplicates
+gene_map_repop <- gene_map_repop[!duplicated(gene_map_repop$GENEID), ]
+
+repop_res_df$gene_name <- gene_map_repop$SYMBOL[match(gen_clean_repop, gene_map_repop$GENEID)]
+repop_res_df$gene_name[is.na(repop_res_df$gene_name)] <- gen_ids_repop[is.na(repop_res_df$gene_name)]
 ```
