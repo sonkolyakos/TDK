@@ -65,14 +65,14 @@ Figure numbers follow the thesis.
 
 | Figure | Content | Script |
 |---|---|---|
-| 4–5 | DGE volcano plots, GSEA dot plots | `bulk_analysis/` (DGE / GSEA) |
+| 4–5 | DGE volcano plots, GSEA dot plots | `gene_analysis.Rmd` |
 | 6 | ΔPSI distributions by event type | `rmats_overlap.Rmd` |
 | 7A–C | event-type proportions, event overlap | `rmats_overlap.Rmd` |
 | 8 | trajectory heatmaps | `integration.Rmd` |
 | 9 | UpSet plots, rMATS vs LeafCutter | `integration.Rmd` |
 | 10 | rMATS vs LeafCutter directional concordance | `integration.Rmd` |
 | 11 | multi-database ORA | `common_genes_multiDB_ORA.R` |
-| 12–14 | DAS vs DGE, ΔPSI vs log2FC, cross-cell-line concordance | `bulk_analysis/` (DAS vs DGE) |
+| 12–14 | DAS vs DGE, ΔPSI vs log2FC, cross-cell-line concordance | `dge_das_overlap` |
 | 15–20 | sashimi plots and splice-composition bar plots | `sashimi/` |
 | 17 | mean \|ΔPSI\| trajectory profiles | `integration.Rmd` |
 
